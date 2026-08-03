@@ -1,0 +1,64 @@
+{
+  "name": "FaceUnity-Nama",
+  "id": "FaceUnity-Nama",
+  "version": "1.2.1",
+  "description": "FaceUnity CNama SDK 9.0.1（皮肤分割/祛斑/丰盈/全身磨皮/瞳孔）",
+  "_dp_type": "nativeplugin",
+  "_dp_nativeplugin": {
+    "android": {
+      "integrateType": "aar",
+      "plugins": [
+        {
+          "type": "module",
+          "name": "FaceUnity-Nama",
+          "class": "com.faceunity.nama.NamaModule"
+        }
+      ],
+      "libs": [
+        "nama.jar"
+      ],
+      "abis": [
+        "armeabi-v7a",
+        "arm64-v8a"
+      ],
+      "minSdkVersion": "21"
+    },
+    "ios": {
+      "integrateType": "framework",
+      "plugins": [
+        {
+          "type": "module",
+          "name": "FaceUnity-Nama",
+          "class": "NamaModule"
+        }
+      ],
+      "deploymentTarget": "11.0",
+      "validArchitectures": [
+        "arm64"
+      ],
+      "frameworks": [
+        "FaceUnityNama.framework",
+        "GLKit.framework",
+        "OpenGLES.framework",
+        "Accelerate.framework",
+        "CoreMedia.framework",
+        "AVFoundation.framework",
+        "CoreVideo.framework",
+        "CoreML.framework",
+        "Photos.framework",
+        "UIKit.framework",
+        "Foundation.framework",
+        "WebKit.framework"
+      ],
+      "embedFrameworks": [
+        "FaceUnityNama.framework"
+      ],
+      "privacies": [
+        "NSCameraUsageDescription",
+        "NSMicrophoneUsageDescription",
+        "NSPhotoLibraryUsageDescription",
+        "NSPhotoLibraryAddUsageDescription"
+      ]
+    }
+  }
+}

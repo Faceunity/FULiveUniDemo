@@ -1,0 +1,131 @@
+{
+    "name" : "surpport",
+    "appid" : "__UNI__D06F9A1",
+    "description" : "",
+    "versionName" : "1.0.0",
+    "versionCode" : 100,
+    "transformPx" : false,
+    "app-plus" : {
+        "usingComponents" : true,
+        "nvueStyleCompiler" : "uni-app",
+        "compilerVersion" : 3,
+        "titleNView" : false,
+        "splashscreen" : {
+            "alwaysShowBeforeRender" : true,
+            "waiting" : true,
+            "autoclose" : true,
+            "delay" : 0
+        },
+        "modules" : {
+            "Camera" : {},
+            "Gallery" : {}
+        },
+        "nativePlugins" : {
+            "FaceUnity-Nama" : {
+                "__plugin_info__" : {
+                    "name" : "FaceUnity-Nama",
+                    "description" : "FaceUnity CNama SDK",
+                    "platforms" : "Android,iOS",
+                    "url" : "",
+                    "android_package_name" : "",
+                    "ios_bundle_id" : "",
+                    "isCloud" : false,
+                    "bought" : -1,
+                    "pid" : "",
+                    "parameters" : {}
+                }
+            }
+        },
+        "distribute" : {
+            "icons" : {
+                "android" : {
+                    "hdpi" : "src/static/app-icons/72x72.png",
+                    "xhdpi" : "src/static/app-icons/96x96.png",
+                    "xxhdpi" : "src/static/app-icons/144x144.png",
+                    "xxxhdpi" : "src/static/app-icons/192x192.png"
+                },
+                "ios" : {
+                    "appstore" : "src/static/app-icons/1024x1024.png",
+                    "ipad" : {
+                        "app" : "src/static/app-icons/76x76.png",
+                        "app@2x" : "src/static/app-icons/152x152.png",
+                        "notification" : "src/static/app-icons/20x20.png",
+                        "notification@2x" : "src/static/app-icons/40x40.png",
+                        "proapp@2x" : "src/static/app-icons/167x167.png",
+                        "settings" : "src/static/app-icons/29x29.png",
+                        "settings@2x" : "src/static/app-icons/58x58.png",
+                        "spotlight" : "src/static/app-icons/40x40.png",
+                        "spotlight@2x" : "src/static/app-icons/80x80.png"
+                    },
+                    "iphone" : {
+                        "app@2x" : "src/static/app-icons/120x120.png",
+                        "app@3x" : "src/static/app-icons/180x180.png",
+                        "notification@2x" : "src/static/app-icons/40x40.png",
+                        "notification@3x" : "src/static/app-icons/60x60.png",
+                        "settings@2x" : "src/static/app-icons/58x58.png",
+                        "settings@3x" : "src/static/app-icons/87x87.png",
+                        "spotlight@2x" : "src/static/app-icons/80x80.png",
+                        "spotlight@3x" : "src/static/app-icons/120x120.png"
+                    }
+                }
+            },
+            "android" : {
+                "screenOrientation" : [ "portrait-primary" ],
+                "permissions" : [
+                    "<uses-permission android:name=\"android.permission.CHANGE_NETWORK_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.MOUNT_UNMOUNT_FILESYSTEMS\"/>",
+                    "<uses-permission android:name=\"android.permission.VIBRATE\"/>",
+                    "<uses-permission android:name=\"android.permission.READ_LOGS\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_WIFI_STATE\"/>",
+                    "<uses-feature android:name=\"android.hardware.camera.autofocus\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.CAMERA\"/>",
+                    "<uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>",
+                    "<uses-permission android:name=\"android.permission.GET_ACCOUNTS\"/>",
+                    "<uses-permission android:name=\"android.permission.READ_PHONE_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.CHANGE_WIFI_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.WAKE_LOCK\"/>",
+                    "<uses-permission android:name=\"android.permission.FLASHLIGHT\"/>",
+                    "<uses-feature android:name=\"android.hardware.camera\"/>",
+                    "<uses-permission android:name=\"android.permission.WRITE_SETTINGS\"/>",
+                    "<uses-permission android:name=\"android.permission.READ_EXTERNAL_STORAGE\"/>",
+                    "<uses-permission android:name=\"android.permission.WRITE_EXTERNAL_STORAGE\"/>",
+                    "<uses-permission android:name=\"android.permission.READ_MEDIA_IMAGES\"/>",
+                    "<uses-permission android:name=\"android.permission.READ_MEDIA_VIDEO\"/>"
+                ]
+            },
+            "ios" : {
+                "screenOrientation" : [ "portrait-primary" ],
+                "dSYMs" : false,
+                "privacyDescription" : {
+                    "NSCameraUsageDescription" : "需要使用相机进行美颜拍摄",
+                    "NSMicrophoneUsageDescription" : "需要使用麦克风进行音视频拍摄",
+                    "NSPhotoLibraryUsageDescription" : "需要访问相册保存照片",
+                    "NSPhotoLibraryAddUsageDescription" : "需要保存拍摄的照片到相册"
+                }
+            },
+            "sdkConfigs" : {}
+        }
+    },
+    "quickapp" : {},
+    "mp-weixin" : {
+        "appid" : "",
+        "setting" : {
+            "urlCheck" : false
+        },
+        "usingComponents" : true
+    },
+    "mp-alipay" : {
+        "usingComponents" : true
+    },
+    "mp-baidu" : {
+        "usingComponents" : true
+    },
+    "mp-toutiao" : {
+        "usingComponents" : true
+    },
+    "uniStatistics" : {
+        "enable" : false
+    },
+    "vueVersion" : "3"
+}
