@@ -1,0 +1,6 @@
+# HBuilderX 云打包「上传计费体积」忽略列表（不删本地文件）
+node_modules/
+dist/
+unpackage/
+pnpm-lock.yaml
+scripts/

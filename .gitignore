@@ -1,0 +1,19 @@
+node_modules/
+dist/
+unpackage/
+scripts/build-bridge/classes/
+scripts/build-bridge/out/
+scripts/build-bridge/deps/
+scripts/build-ios-framework/out/
+scripts/build-ios-framework/out-slim/
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
+# Nama bundle / 鉴权（本地放置，勿提交）
+src/static/nama-bundle/*.bundle
+scripts/build-bridge/src/com/faceunity/app/authpack.java
+scripts/build-ios-framework/src/ios/authpack.h
+nativeplugins/FaceUnity-Nama/ios/authpack.h
+src/static/authpack.*

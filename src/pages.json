@@ -1,0 +1,110 @@
+{
+	"pages": [
+		{
+			"path": "pages/index/index",
+			"style": {
+				"navigationStyle": "custom",
+				"backgroundColor": "#090017",
+				"app-plus": {
+					"titleNView": false,
+					"background": "#090017",
+					"statusbar": {
+						"style": "light",
+						"background": "#030010"
+					},
+					"safearea": {
+						"background": "#090017",
+						"top": {
+							"offset": "none"
+						}
+					}
+				}
+			}
+		},
+		{
+			"path": "pages/media-import/media-import",
+			"style": {
+				"navigationStyle": "custom",
+				"backgroundColor": "#000000",
+				"app-plus": {
+					"titleNView": false,
+					"background": "#000000",
+					"statusbar": {
+						"style": "light",
+						"background": "#000000"
+					},
+					"safearea": {
+						"background": "#000000",
+						"top": {
+							"offset": "none"
+						}
+					}
+				}
+			}
+		},
+		{
+			"path": "pages/media-beauty/media-beauty",
+			"style": {
+				"navigationStyle": "custom",
+				"backgroundColor": "#000000",
+				"app-plus": {
+					"titleNView": false,
+					"background": "#000000",
+					"disableScroll": true,
+					"bounce": "none",
+					"scrollIndicator": "none",
+					"statusbar": {
+						"style": "light",
+						"background": "#000000"
+					},
+					"safearea": {
+						"background": "#000000",
+						"top": {
+							"offset": "none"
+						},
+						"bottom": {
+							"offset": "none"
+						}
+					}
+				}
+			}
+		},
+		{
+			"path": "pages/beauty/beauty",
+			"style": {
+				"navigationStyle": "custom",
+				"backgroundColor": "#000000",
+				"app-plus": {
+					"titleNView": false,
+					"background": "#000000",
+					"disableScroll": true,
+					"bounce": "none",
+					"scrollIndicator": "none",
+					"statusbar": {
+						"style": "light",
+						"background": "#000000"
+					},
+					"safearea": {
+						"background": "#000000",
+						"top": {
+							"offset": "none"
+						},
+						"bottom": {
+							"offset": "none"
+						}
+					}
+				}
+			}
+		}
+	],
+	"globalStyle": {
+		"navigationStyle": "custom",
+		"navigationBarTextStyle": "white",
+		"backgroundColor": "#000000",
+		"pageOrientation": "portrait",
+		"app-plus": {
+			"titleNView": false,
+			"background": "#000000"
+		}
+	}
+}

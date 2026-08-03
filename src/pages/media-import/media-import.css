@@ -1,0 +1,88 @@
+.page {
+  position: relative;
+  height: 100vh;
+  overflow: hidden;
+  background: #000000;
+}
+
+/* Demo：左上返回 44×44，leading 10；Android 状态栏下留 8px 即可（原 +20 顶部空白过大） */
+.back-btn {
+  position: fixed;
+  left: 20rpx;
+  z-index: 21;
+  width: 88rpx;
+  height: 88rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.back-btn__icon {
+  width: 44rpx;
+  height: 44rpx;
+}
+
+/*
+ * Demo 约束：
+ * - 选择图片：屏幕正中，235×48
+ * - 选择视频：图片底边 + 44
+ * - 文案：图片顶边 - 74，左右 20，居中
+ */
+.message {
+  position: fixed;
+  left: 40rpx;
+  right: 40rpx;
+  top: calc(50% - 24px - 74px - 24px);
+  z-index: 10;
+  text-align: center;
+  font-size: 34rpx;
+  line-height: 1.4;
+  color: #ffffff;
+}
+
+.pick-btn {
+  position: fixed;
+  left: 50%;
+  z-index: 10;
+  width: 470rpx;
+  height: 96rpx;
+  margin-left: -235rpx;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  background-image: url('/static/media-picker/btn-bg.png');
+  background-size: 100% 100%;
+  background-repeat: no-repeat;
+}
+
+.pick-btn--image {
+  top: 50%;
+  margin-top: -48rpx;
+}
+
+.pick-btn--video {
+  top: calc(50% + 24px + 44px);
+}
+
+.pick-btn--disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.pick-btn__icon {
+  width: 40rpx;
+  height: 40rpx;
+  margin-right: 12rpx;
+  flex-shrink: 0;
+}
+
+.pick-btn__text {
+  font-size: 32rpx;
+  color: #ffffff;
+  font-weight: 500;
+}
+
+.pick-btn:active .pick-btn__text {
+  color: rgba(255, 255, 255, 0.6);
+}
