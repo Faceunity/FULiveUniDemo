@@ -60,7 +60,7 @@ npm run build:ios-framework
   - `ai_face_processor.bundle`
   - `face_beautification.bundle`
 - 运行时从 static 读取，**不访问 OSS**（滤镜预览图 CDN 除外）
-- 文件约 29MB，已 gitignore；打云包前须本地放齐
+- 两个 `.bundle` 随仓库提交，打云包前确认目录下文件齐全
 
 ## 打基座 / 云打包
 
