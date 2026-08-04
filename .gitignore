@@ -11,8 +11,7 @@ scripts/build-ios-framework/out-slim/
 Thumbs.db
 .env
 .env.*
-# Nama bundle / 鉴权（本地放置，勿提交）
-src/static/nama-bundle/*.bundle
+# 鉴权文件（本地放置，勿提交）
 scripts/build-bridge/src/com/faceunity/app/authpack.java
 scripts/build-ios-framework/src/ios/authpack.h
 nativeplugins/FaceUnity-Nama/ios/authpack.h
