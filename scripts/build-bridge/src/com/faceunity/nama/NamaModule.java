@@ -1,9 +1,11 @@
 package com.faceunity.nama;
 
+import android.opengl.GLSurfaceView;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
@@ -17,16 +19,31 @@ import android.view.ViewGroup;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.PopupWindow;
-import android.widget.TextView;
 
 import com.alibaba.fastjson.JSONObject;
-import com.faceunity.app.authpack;
+import com.faceunity.nama.core.BeautyCameraGLView;
+import com.faceunity.nama.core.BeautyParamApplier;
+import com.faceunity.nama.core.BeautyVideoGLView;
+import com.faceunity.nama.core.DeviceQuirk;
+import com.faceunity.nama.core.FuBeautyHandle;
+import com.faceunity.nama.core.FuBeautyPerfGate;
+import com.faceunity.nama.core.ImageBeautyProcessor;
+import com.faceunity.nama.core.MediaFuSetup;
+import com.faceunity.nama.core.NamaGlExecutor;
+import com.faceunity.nama.core.NamaSdkManager;
+import com.faceunity.nama.core.VideoBeautyProcessor;
+import com.faceunity.nama.ui.FocusHudView;
+import com.faceunity.nama.ui.FuBeautyPanelView;
+import com.faceunity.nama.ui.FuExportProgressHud;
+import com.faceunity.nama.ui.NamaToast;
+import com.faceunity.nama.ui.PreviewChromeView;
+import com.faceunity.nama.utils.MediaPathUtil;
+import com.faceunity.nama.utils.NamaJsResult;
 import com.faceunity.wrapper.faceunity;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
 import java.lang.reflect.Field;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import io.dcloud.feature.uniapp.annotation.UniJSMethod;
 import io.dcloud.feature.uniapp.bridge.UniJSCallback;
@@ -44,18 +61,19 @@ public class NamaModule extends UniModule {
     private UniJSCallback pickMediaCallback;
     private String pickMediaExt = ".jpg";
 
-    private static int beautyItemHandle = 0;
-    private static int mediaBeautyItemHandle = 0;
-    private static boolean initialized = false;
-    private static boolean aiModelLoaded = false;
     private static BeautyCameraGLView overlayCameraView;
     private static FrameLayout overlayCameraHost;
+    /**
+     * 系统导航切换会重建 Activity。此后 park 若再 setZOrderOnTop(false)，
+     * Android 会毁掉 Surface/EGL，第二次进相机复用旧 beauty handle 就会无美颜或黑屏。
+     */
+    private static volatile boolean sPreserveCameraEglOnPark = false;
+    /** 进后台时记住曝光 UI，回前台恢复（避免拉杆误跳 100） */
+    private static int sPausedExposureUi = -1;
     /** 视频预览过后：静图勿再走相机 GL，避免矩阵残留颠倒；纯导入图片仍走相机 GL（已验证正常） */
     private static volatile boolean sAvoidCameraGlForImageAfterVideo = false;
     /** 仅视频交还相机时为 true；soft-hide 不要走 resumeGlAfterHandoff（成对 onPause 缺失会黑屏） */
     private static volatile boolean sCameraGlHandedOff = false;
-    /** true：相机由 nvue &lt;beauty-camera&gt; 托管，不挂 decor 叠层 */
-    private static volatile boolean cameraHostedByComponent = false;
     private static BeautyVideoGLView overlayVideoView;
     private static FrameLayout overlayVideoHost;
     private static ImageView overlayVideoPlayBtn;
@@ -64,8 +82,9 @@ public class NamaModule extends UniModule {
     private static PopupWindow previewChromePopup;
     private static FuBeautyPanelView beautyPanelView;
     private static PopupWindow beautyPanelPopup;
-    /** 媒体页左上角返回（挂 Decor，对齐 iOS ensureMediaBackButton） */
+    /** 媒体页左上角返回（PopupWindow 盖住 setZOrderOnTop 的视频 GLSurfaceView） */
     private static FrameLayout mediaBackBtn;
+    private static PopupWindow mediaBackPopup;
     private static int lastCssX = -1;
     private static int lastCssY = -1;
     private static int lastCssW = -1;
@@ -74,176 +93,74 @@ public class NamaModule extends UniModule {
     private static FocusHudView focusHudView;
     private static PopupWindow focusHudPopup;
 
-    /** 滤镜名 / 未检测到人脸：PopupWindow 盖住 ZOrderOnTop 取景与底栏 */
-    private static FrameLayout sTipsHost;
-    private static TextView sNoFaceTip;
-    private static TextView sFilterTip;
-    private static PopupWindow sTipsPopup;
-    private static final Handler sTipsHandler = new Handler(Looper.getMainLooper());
-    private static Runnable sFilterHideTask;
-    private static volatile boolean sFaceTracked = true;
-    private static volatile boolean sTipsEnabled = false;
-    private static volatile long sTipsEnabledAtMs = 0L;
     private static PopupWindow sExportHudPopup;
     /** SDK DEBUG 文件日志路径（{@link MediaFuSetup#SDK_LOG_FILE_NAME}） */
-    /** nvue BeautyCameraComponent 创建 GL 后注册 */
-    public static void attachHostedCameraView(BeautyCameraGLView view) {
-        if (view == null) {
-            return;
-        }
-        // 若仍有旧 decor 叠层，先拆掉，避免双预览
-        if (overlayCameraHost != null) {
-            try {
-                final FrameLayout host = overlayCameraHost;
-                final BeautyCameraGLView old = overlayCameraView;
-                overlayCameraHost = null;
-                if (old != null && old != view) {
-                    old.destroyPreviewAsync(null);
-                }
-                new Handler(Looper.getMainLooper()).post(() -> {
-                    try {
-                        ViewGroup parent = (ViewGroup) host.getParent();
-                        if (parent != null) {
-                            parent.removeView(host);
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                });
-            } catch (Throwable ignored) {
-            }
-        }
-        overlayCameraView = view;
-        overlayCameraHost = null;
-        cameraHostedByComponent = true;
-        Log.e(TAG, "attachHostedCameraView");
-    }
-
-    /** 组件 destroy 时注销 */
-    public static void detachHostedCameraView(BeautyCameraGLView view) {
-        if (view == null) {
-            return;
-        }
-        if (overlayCameraView == view) {
-            overlayCameraView = null;
-            cameraHostedByComponent = false;
-            Log.e(TAG, "detachHostedCameraView");
-        }
-    }
-
-    public static boolean isCameraHostedByComponent() {
-        return cameraHostedByComponent && overlayCameraView != null;
-    }
 
     /** 视频显示层取相机 GL：Nama 只挂在相机上下文，视频页禁止自建 Nama */
-    static BeautyCameraGLView peekCameraOverlay() {
+    public static BeautyCameraGLView peekCameraOverlay() {
         return overlayCameraView;
     }
 
     static void setPreviewTipsEnabled(boolean enabled) {
-        sTipsEnabled = enabled;
-        if (enabled) {
-            sTipsEnabledAtMs = System.currentTimeMillis();
-            sFaceTracked = true;
+        NamaToast.setTipsEnabled(enabled);
+        if (previewChromeView != null) {
+            previewChromeView.setTipsEnabled(enabled);
+            if (enabled) {
+                previewChromeView.setNoFaceVisible(false);
+            }
         }
-        sTipsHandler.post(() -> {
-            if (previewChromeView != null) {
-                previewChromeView.setTipsEnabled(enabled);
-                if (enabled) {
-                    previewChromeView.setNoFaceVisible(false);
-                }
-                return;
-            }
-            if (!enabled) {
-                hideTipsOverlay();
-            } else {
-                Activity act = resolveStaticActivity();
-                if (act != null) {
-                    ensureTipsOverlay(act);
-                    updateNoFaceTipUi();
-                }
-            }
-        });
     }
 
     /** GL 线程上报人脸跟踪；主线程刷新「未检测到人脸」 */
-    static void onFaceTrackingUpdated(boolean tracked) {
-        if (sFaceTracked == tracked) {
-            return;
-        }
-        sFaceTracked = tracked;
-        sTipsHandler.post(() -> {
-            if (previewChromeView != null) {
-                previewChromeView.setNoFaceVisible(sTipsEnabled && !tracked);
-            } else {
-                updateNoFaceTipUi();
+    public static void onFaceTrackingUpdated(boolean tracked) {
+        NamaToast.onFaceTrackingUpdated(tracked);
+        final boolean faceTracked = tracked;
+        new Handler(Looper.getMainLooper()).post(() -> {
+            try {
+                if (previewChromeView != null) {
+                    // PreviewChrome 自带 tipsEnabled 判断；勿在 GL 线程直接改 View
+                    previewChromeView.setNoFaceVisible(!faceTracked);
+                } else {
+                    Activity act = resolveStaticActivity();
+                    if (act != null) {
+                        NamaToast.setNoFaceVisible(act, !faceTracked);
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "onFaceTrackingUpdated ui", t);
             }
         });
     }
 
     /** 机型限制提示（对齐 iOS showPreviewPerfLimitTip / FULiveDemo 灰显点击 toast） */
-    static void showPerfLimitTip(String message) {
+    public static void showPerfLimitTip(String message) {
         if (message == null || message.isEmpty()) {
             return;
         }
-        sTipsHandler.post(() -> {
-            if (previewChromeView != null) {
-                previewChromeView.showPerfLimitTip(message);
-                return;
-            }
-            Activity act = resolveStaticActivity();
-            if (act == null) {
-                return;
-            }
-            ensureTipsOverlay(act);
-            if (sFilterTip != null) {
-                sFilterTip.setTextSize(14);
-                sFilterTip.setText(message);
-                sFilterTip.setVisibility(View.VISIBLE);
-                if (sFilterHideTask != null) {
-                    sTipsHandler.removeCallbacks(sFilterHideTask);
-                }
-                sFilterHideTask = () -> {
-                    if (sFilterTip != null) {
-                        sFilterTip.setVisibility(View.GONE);
-                        sFilterTip.setTextSize(20);
-                    }
-                };
-                sTipsHandler.postDelayed(sFilterHideTask, 2000L);
-            }
-        });
+        if (previewChromeView != null) {
+            previewChromeView.showPerfLimitTip(message);
+            return;
+        }
+        Activity act = resolveStaticActivity();
+        if (act != null) {
+            NamaToast.showPerfLimitTip(act, message);
+        }
     }
 
     /** 切滤镜：画面正中短暂显示滤镜名（对齐 Demo） */
-    static void showFilterNameTip(String name) {
+    public static void showFilterNameTip(String name) {
         if (name == null || name.isEmpty()) {
             return;
         }
-        sTipsHandler.post(() -> {
-            boolean mediaOverlay = overlayVideoView != null || overlayVideoHost != null;
-            if (!mediaOverlay && previewChromeView != null && overlayCameraView != null) {
-                previewChromeView.showFilterNameTip(name);
-                return;
-            }
-            Activity act = resolveStaticActivity();
-            if (act == null) {
-                return;
-            }
-            ensureTipsOverlay(act);
-            if (sFilterTip == null) {
-                return;
-            }
-            sFilterTip.setText(name);
-            sFilterTip.setVisibility(View.VISIBLE);
-            if (sFilterHideTask != null) {
-                sTipsHandler.removeCallbacks(sFilterHideTask);
-            }
-            sFilterHideTask = () -> {
-                if (sFilterTip != null) {
-                    sFilterTip.setVisibility(View.GONE);
-                }
-            };
-            sTipsHandler.postDelayed(sFilterHideTask, 1000L);
-        });
+        boolean mediaOverlay = overlayVideoView != null || overlayVideoHost != null;
+        if (!mediaOverlay && previewChromeView != null && overlayCameraView != null) {
+            previewChromeView.showFilterNameTip(name);
+            return;
+        }
+        Activity act = resolveStaticActivity();
+        if (act != null) {
+            NamaToast.showFilterName(act, name);
+        }
     }
 
     private static Activity resolveStaticActivity() {
@@ -263,119 +180,6 @@ public class NamaModule extends UniModule {
         } catch (Throwable ignored) {
         }
         return null;
-    }
-
-    private static void ensureTipsOverlay(Activity activity) {
-        if (activity == null) {
-            return;
-        }
-        try {
-            if (sTipsHost == null) {
-                sTipsHost = new FrameLayout(activity);
-                sTipsHost.setClickable(false);
-                sTipsHost.setFocusable(false);
-
-                sNoFaceTip = new TextView(activity);
-                sNoFaceTip.setText("未检测到人脸");
-                sNoFaceTip.setTextColor(0xFFFFFFFF);
-                sNoFaceTip.setTextSize(16);
-                sNoFaceTip.setGravity(Gravity.CENTER);
-                sNoFaceTip.setShadowLayer(4f, 0f, 1f, 0x99000000);
-                sNoFaceTip.setVisibility(View.GONE);
-                FrameLayout.LayoutParams nlp = new FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                nlp.gravity = Gravity.CENTER;
-                sTipsHost.addView(sNoFaceTip, nlp);
-
-                sFilterTip = new TextView(activity);
-                sFilterTip.setTextColor(0xFFFFFFFF);
-                sFilterTip.setTextSize(20);
-                sFilterTip.setGravity(Gravity.CENTER);
-                sFilterTip.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-                sFilterTip.setShadowLayer(6f, 0f, 2f, 0xCC000000);
-                sFilterTip.setVisibility(View.GONE);
-                FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                flp.gravity = Gravity.CENTER;
-                sTipsHost.addView(sFilterTip, flp);
-            }
-            if (sTipsPopup == null) {
-                sTipsPopup = new PopupWindow(sTipsHost,
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        false);
-                sTipsPopup.setTouchable(false);
-                sTipsPopup.setFocusable(false);
-                sTipsPopup.setOutsideTouchable(false);
-                sTipsPopup.setClippingEnabled(false);
-                sTipsPopup.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0x00000000));
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    // 高于 chrome(120) / 美颜面板(140)，低于导出 HUD(300)
-                    sTipsPopup.setElevation(200f);
-                }
-            } else if (sTipsPopup.getContentView() != sTipsHost) {
-                sTipsPopup.setContentView(sTipsHost);
-            }
-            if (!sTipsPopup.isShowing()) {
-                if (activity.isFinishing()) {
-                    return;
-                }
-                View decor = activity.getWindow() != null ? activity.getWindow().getDecorView() : null;
-                if (decor == null || decor.getWindowToken() == null) {
-                    // 窗口未就绪：延后一帧，避免 BadToken 闪退
-                    decor = activity.getWindow() != null ? activity.getWindow().getDecorView() : null;
-                    final Activity act = activity;
-                    sTipsHandler.post(() -> {
-                        try {
-                            if (act.isFinishing() || sTipsPopup == null || sTipsPopup.isShowing()) {
-                                return;
-                            }
-                            View d = act.getWindow() != null ? act.getWindow().getDecorView() : null;
-                            if (d != null && d.getWindowToken() != null) {
-                                sTipsPopup.showAtLocation(d, Gravity.NO_GRAVITY, 0, 0);
-                            }
-                        } catch (Throwable t) {
-                            Log.w(TAG, "ensureTipsOverlay delayed show", t);
-                        }
-                    });
-                    return;
-                }
-                sTipsPopup.showAtLocation(decor, Gravity.NO_GRAVITY, 0, 0);
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "ensureTipsOverlay", t);
-        }
-    }
-
-    private static void hideTipsOverlay() {
-        try {
-            if (sFilterHideTask != null) {
-                sTipsHandler.removeCallbacks(sFilterHideTask);
-                sFilterHideTask = null;
-            }
-            if (sNoFaceTip != null) {
-                sNoFaceTip.setVisibility(View.GONE);
-            }
-            if (sFilterTip != null) {
-                sFilterTip.setVisibility(View.GONE);
-            }
-            if (sTipsPopup != null && sTipsPopup.isShowing()) {
-                sTipsPopup.dismiss();
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void updateNoFaceTipUi() {
-        if (!sTipsEnabled || sNoFaceTip == null) {
-            return;
-        }
-        // 开镜前 2s 不提示，避免冷启动误报
-        if (System.currentTimeMillis() - sTipsEnabledAtMs < 2000L) {
-            sNoFaceTip.setVisibility(View.GONE);
-            return;
-        }
-        sNoFaceTip.setVisibility(sFaceTracked ? View.GONE : View.VISIBLE);
     }
 
     @UniJSMethod(uiThread = false)
@@ -410,12 +214,7 @@ public class NamaModule extends UniModule {
         if (callback == null) {
             return;
         }
-        try {
-            String version = faceunity.fuGetVersion();
-            callback.invoke(success(version));
-        } catch (Throwable e) {
-            callback.invoke(fail(e.getMessage()));
-        }
+        callback.invoke(NamaSdkManager.getVersion());
     }
 
     /** Android 进程存活重进：JS 缓存 sdkInited 时校验 native 是否仍就绪 */
@@ -424,19 +223,183 @@ public class NamaModule extends UniModule {
         if (callback == null) {
             return;
         }
+        watchHostRecreate();
+        JSONObject info = NamaSdkManager.isSdkAlive();
+        // 额外校验宿主 Activity 是否仍有效（导航模式切换等配置变更会重建 Activity）
+        boolean ctxAlive = false;
         try {
-            int libInit = faceunity.fuIsLibraryInit();
-            JSONObject o = new JSONObject();
-            o.put("libInit", libInit);
-            o.put("initialized", initialized);
-            o.put("cameraHandle", FuBeautyHandle.cameraHandle);
-            o.put("mediaHandle", FuBeautyHandle.mediaHandle);
-            o.put("aiLoaded", aiModelLoaded);
-            o.put("alive", libInit != 0 && initialized);
-            callback.invoke(success(o));
-        } catch (Throwable e) {
-            callback.invoke(fail(e.getMessage()));
+            Activity host = resolveHostActivity();
+            ctxAlive = host != null && !host.isFinishing() && !host.isDestroyed();
+        } catch (Throwable ignored) {
         }
+        try {
+            JSONObject data = info.getJSONObject("data");
+            data.put("contextAlive", ctxAlive);
+            boolean overlayMounted = overlayCameraView != null;
+            boolean overlayActDead = false;
+            boolean overlaySurfaceValid = false;
+            try {
+                if (overlayCameraView != null) {
+                    if (overlayCameraView.getContext() instanceof Activity) {
+                        Activity oa = (Activity) overlayCameraView.getContext();
+                        overlayActDead = oa.isFinishing() || oa.isDestroyed();
+                        if (overlayActDead) {
+                            sPreserveCameraEglOnPark = true;
+                        }
+                    }
+                    android.view.SurfaceHolder holder = overlayCameraView.getHolder();
+                    if (holder != null && holder.getSurface() != null) {
+                        overlaySurfaceValid = holder.getSurface().isValid();
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            data.put("overlayMounted", overlayMounted);
+            data.put("overlayActDead", overlayActDead);
+            data.put("overlaySurfaceValid", overlaySurfaceValid);
+        } catch (Throwable ignored) {
+        }
+        callback.invoke(info);
+    }
+
+    private static void runOnMainSync(Runnable action) {
+        if (action == null) {
+            return;
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action.run();
+            return;
+        }
+        final CountDownLatch done = new CountDownLatch(1);
+        new Handler(Looper.getMainLooper()).post(() -> {
+            try {
+                action.run();
+            } finally {
+                done.countDown();
+            }
+        });
+        try {
+            done.await(2, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void detachOverlayHost(View host, View view) {
+        try {
+            if (host != null) {
+                host.setVisibility(View.GONE);
+                ViewGroup parent = (ViewGroup) host.getParent();
+                if (parent != null) {
+                    parent.removeView(host);
+                }
+                return;
+            }
+            if (view != null) {
+                view.setVisibility(View.GONE);
+                ViewGroup parent = (ViewGroup) view.getParent();
+                if (parent != null) {
+                    parent.removeView(view);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void resetParkedBoxCache() {
+        sParkedBoxLeft = Integer.MIN_VALUE;
+        sParkedBoxTop = Integer.MIN_VALUE;
+        sParkedBoxW = -1;
+        sParkedBoxH = -1;
+    }
+
+    /** Activity 被重建后清理 stale 的 overlay 引用，让后续 showCamera/showVideo 能重建 */
+    @UniJSMethod(uiThread = false)
+    public void resetStaleOverlays(UniJSCallback callback) {
+        try {
+            resetStaleOverlaysInternal();
+        } catch (Throwable ignored) {
+        }
+        if (callback != null) {
+            callback.invoke(success(new JSONObject()));
+        }
+    }
+
+    private static void resetStaleOverlaysInternal() {
+        final BeautyCameraGLView cam = overlayCameraView;
+        final FrameLayout camHost = overlayCameraHost;
+        final BeautyVideoGLView video = overlayVideoView;
+        final FrameLayout videoHost = overlayVideoHost;
+        overlayCameraView = null;
+        overlayCameraHost = null;
+        overlayVideoView = null;
+        overlayVideoHost = null;
+        sPreserveCameraEglOnPark = true;
+        resetParkedBoxCache();
+        // 必须从窗口拆掉，只 destroyPreview 会留下暂停帧挡住下一页
+        runOnMainSync(() -> {
+            detachOverlayHost(camHost, cam);
+            if (cam != null) {
+                try {
+                    cam.destroyPreview();
+                } catch (Throwable ignored) {
+                }
+            }
+            detachOverlayHost(videoHost, video);
+            if (video != null) {
+                try {
+                    video.stopAndRelease();
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+        // EGL context 已随旧 Activity 销毁，通知 SDK 清理 stale GL 资源
+        try {
+            MediaFuSetup.deviceLostOnCurrentGl();
+        } catch (Throwable ignored) {
+        }
+        // 清 beauty handle，让后续 loadBundle 重建
+        try {
+            NamaSdkManager.markResourcesLost("resetStaleOverlays");
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (focusHudPopup != null) {
+                focusHudPopup.dismiss();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (mediaBackPopup != null) {
+                mediaBackPopup.dismiss();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (beautyPanelPopup != null) {
+                beautyPanelPopup.dismiss();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (previewChromePopup != null) {
+                previewChromePopup.dismiss();
+            }
+        } catch (Throwable ignored) {
+        }
+        overlayCameraView = null;
+        overlayCameraHost = null;
+        overlayVideoView = null;
+        overlayVideoHost = null;
+        previewChromeView = null;
+        beautyPanelView = null;
+        focusHudView = null;
+        focusHudPopup = null;
+        mediaBackBtn = null;
+        mediaBackPopup = null;
+        beautyPanelPopup = null;
+        previewChromePopup = null;
+        Log.i(TAG, "resetStaleOverlays done");
     }
 
     @UniJSMethod(uiThread = false)
@@ -444,55 +407,21 @@ public class NamaModule extends UniModule {
         if (callback == null) {
             return;
         }
-        try {
-            if (initialized && faceunity.fuIsLibraryInit() != 0) {
-                JSONObject ok = new JSONObject();
-                ok.put("version", faceunity.fuGetVersion());
-                ok.put("fuIsLibraryInit", faceunity.fuIsLibraryInit());
-                callback.invoke(success(ok));
-                return;
-            }
-            if (faceunity.fuIsLibraryInit() == 0) {
-                initialized = false;
-                aiModelLoaded = false;
-                beautyItemHandle = 0;
-                mediaBeautyItemHandle = 0;
-                FuBeautyHandle.clearAll();
-            }
-            byte[] authData = authpack.A();
-            try {
-                Activity actCtx = resolveHostActivity();
-                if (actCtx != null) {
-                    MediaFuSetup.setAppContext(actCtx);
-                }
-            } catch (Throwable ignored) {
-            }
-            int setupCode = faceunity.fuSetup(new byte[0], authData);
-            int libInit = faceunity.fuIsLibraryInit();
-            int systemError = faceunity.fuGetSystemError();
-            String version = faceunity.fuGetVersion();
-            JSONObject diag = new JSONObject();
-            diag.put("version", version);
-            diag.put("authSize", authData.length);
-            diag.put("fuSetupCode", setupCode);
-            diag.put("fuIsLibraryInit", libInit);
-            diag.put("fuGetSystemError", systemError);
-            if (systemError != 0) {
-                diag.put("fuGetSystemErrorString", faceunity.fuGetSystemErrorString(systemError));
-            }
-            if (setupCode == 0) {
-                callback.invoke(fail("fuSetup 失败 code=0", diag));
-                return;
-            }
-            if (libInit == 0) {
-                callback.invoke(fail("SDK 未就绪 fuIsLibraryInit=0（authpack 与包名/签名不匹配）", diag));
-                return;
-            }
-            initialized = true;
-            MediaFuSetup.enableFaceAlgorithmModules();
-            callback.invoke(success(diag));
-        } catch (Exception e) {
-            callback.invoke(fail(e.getMessage()));
+        watchHostRecreate();
+        callback.invoke(NamaSdkManager.init(resolveHostActivity()));
+    }
+
+    /** 切导航后进程还在、Activity 已重建：整进程冷启动，禁止半死复用 overlay */
+    @UniJSMethod(uiThread = true)
+    public void relaunchProcess(UniJSCallback callback) {
+        Activity act = resolveHostActivity();
+        Context ctx = act;
+        if (ctx == null) {
+            ctx = resolveStaticActivity();
+        }
+        NamaHostRecreateWatch.relaunch(ctx);
+        if (callback != null) {
+            callback.invoke(success(0));
         }
     }
 
@@ -501,71 +430,7 @@ public class NamaModule extends UniModule {
         if (callback == null) {
             return;
         }
-        try {
-            ensureInitialized();
-            byte[] data = readFileBytes(options.getString("path"));
-            int aiType = options.getIntValue("aiType");
-            if (aiType == 0) {
-                aiType = faceunity.FUAITYPE_FACEPROCESSOR;
-            }
-            // 必须在 loadAIModel 之前开启全部人脸算法子模块（皮肤分割/ARMeshV2/丰盈/瞳孔等）
-            MediaFuSetup.enableFaceAlgorithmModules();
-            if (aiModelLoaded) {
-                try {
-                    faceunity.fuReleaseAIModel(faceunity.FUAITYPE_FACEPROCESSOR);
-                } catch (Throwable ignored) {
-                }
-                aiModelLoaded = false;
-            }
-            // release 可能把 algorithmConfig 打回 -1，load 前必须再开一次（对齐 iOS）
-            MediaFuSetup.enableFaceAlgorithmModules();
-            FuAiExtras.resetSetUseApplied();
-            int handle = faceunity.fuLoadAIModelFromPackage(data, aiType);
-            if (handle <= 0) {
-                callback.invoke(fail("loadAIModel 失败 handle=" + handle));
-                return;
-            }
-            // load 后再开公开侧运行时开关
-            MediaFuSetup.enableAdvancedBeautyRuntime(0);
-            aiModelLoaded = true;
-            configureFaceProcessor();
-            if (beautyItemHandle > 0) {
-                FuBeautyPerfGate.enforceOnHandle(beautyItemHandle);
-            }
-            if (mediaBeautyItemHandle > 0) {
-                FuBeautyPerfGate.enforceOnHandle(mediaBeautyItemHandle);
-            }
-            int faceOk = 0;
-            try {
-                faceOk = faceunity.fuIsAIModelLoaded(faceunity.FUAITYPE_FACEPROCESSOR);
-            } catch (Throwable ignored) {
-            }
-            int m0 = 0, m1 = 0, m2 = 0, m3 = 0;
-            try {
-                m0 = faceunity.fuGetModuleCode(0);
-                m1 = faceunity.fuGetModuleCode(1);
-                m2 = faceunity.fuGetModuleCode(2);
-                m3 = faceunity.fuGetModuleCode(3);
-            } catch (Throwable ignored) {
-            }
-            long aiBytes = data != null ? data.length : 0;
-            Log.e(TAG, "loadAIModel ok handle=" + handle
-                    + " aiBytes=" + aiBytes
-                    + " faceLoaded=" + faceOk
-                    + " ARMeshV2=1 algo=ENABLE_ALL"
-                    + " module=[" + m0 + "," + m1 + "," + m2 + "," + m3 + "]");
-            JSONObject dataOut = new JSONObject();
-            dataOut.put("handle", handle);
-            dataOut.put("aiBytes", aiBytes);
-            dataOut.put("faceLoaded", faceOk);
-            dataOut.put("moduleCode0", m0);
-            dataOut.put("moduleCode1", m1);
-            dataOut.put("moduleCode2", m2);
-            dataOut.put("moduleCode3", m3);
-            callback.invoke(success(dataOut));
-        } catch (Exception e) {
-            callback.invoke(fail(e.getMessage()));
-        }
+        callback.invoke(NamaSdkManager.loadAIModel(options));
     }
 
     @UniJSMethod(uiThread = false)
@@ -573,39 +438,7 @@ public class NamaModule extends UniModule {
         if (callback == null) {
             return;
         }
-        try {
-            ensureInitialized();
-            byte[] data = readFileBytes(options.getString("path"));
-            String pipeline = options != null ? options.getString("pipeline") : null;
-            boolean media = pipeline != null && "media".equalsIgnoreCase(pipeline);
-            int old = media ? mediaBeautyItemHandle : beautyItemHandle;
-            if (old > 0) {
-                try {
-                    faceunity.fuDestroyItem(old);
-                } catch (Exception ignored) {
-                }
-            }
-            int handle = faceunity.fuCreateItemFromPackage(data);
-            if (handle <= 0) {
-                callback.invoke(fail("loadBundle 失败 handle=" + handle));
-                return;
-            }
-            MediaFuSetup.enableAdvancedBeautyRuntime(handle);
-            MediaFuSetup.ensureBeautyOn(handle);
-            if (media) {
-                mediaBeautyItemHandle = handle;
-                FuBeautyHandle.setPipelineHandle(true, handle);
-            } else {
-                beautyItemHandle = handle;
-                FuBeautyHandle.setPipelineHandle(false, handle);
-            }
-            JSONObject dataOut = new JSONObject();
-            dataOut.put("handle", handle);
-            dataOut.put("pipeline", media ? "media" : "camera");
-            callback.invoke(success(dataOut));
-        } catch (Exception e) {
-            callback.invoke(fail(e.getMessage()));
-        }
+        callback.invoke(NamaSdkManager.loadBundle(options));
     }
 
     /** JS 复用相机 beauty handle 时，同步原生 mediaBeautyItemHandle，避免媒体页 handle=0 */
@@ -614,30 +447,7 @@ public class NamaModule extends UniModule {
         if (callback == null) {
             return;
         }
-        try {
-            int handle = options != null ? options.getIntValue("handle") : 0;
-            if (handle <= 0) {
-                handle = beautyItemHandle > 0 ? beautyItemHandle : FuBeautyHandle.cameraHandle;
-            }
-            if (handle <= 0) {
-                callback.invoke(fail("无可用 beauty handle"));
-                return;
-            }
-            mediaBeautyItemHandle = handle;
-            FuBeautyHandle.setPipelineHandle(true, handle);
-            MediaFuSetup.enableAdvancedBeautyRuntime(handle);
-            MediaFuSetup.ensureBeautyOn(handle);
-            Log.i(TAG, "bindMediaBeautyHandle handle=" + handle
-                    + " camera=" + beautyItemHandle
-                    + " media=" + mediaBeautyItemHandle);
-            JSONObject data = new JSONObject();
-            data.put("handle", handle);
-            data.put("mediaHandle", mediaBeautyItemHandle);
-            data.put("cameraHandle", beautyItemHandle);
-            callback.invoke(success(data));
-        } catch (Exception e) {
-            callback.invoke(fail(e.getMessage()));
-        }
+        callback.invoke(NamaSdkManager.bindMediaBeautyHandle(options));
     }
 
     @UniJSMethod(uiThread = false)
@@ -645,87 +455,7 @@ public class NamaModule extends UniModule {
         if (callback == null) {
             return;
         }
-        try {
-            ensureInitialized();
-            int handle = options.getIntValue("handle");
-            if (handle <= 0) {
-                String pipeline = options.getString("pipeline");
-                boolean media = pipeline != null && "media".equalsIgnoreCase(pipeline);
-                handle = media ? mediaBeautyItemHandle : beautyItemHandle;
-                if (handle <= 0) {
-                    handle = media ? FuBeautyHandle.mediaHandle : FuBeautyHandle.cameraHandle;
-                }
-            }
-            if (handle <= 0) {
-                callback.invoke(fail("请先 loadBundle"));
-                return;
-            }
-            int code;
-            String key = options.getString("key");
-            String stringValue = options.getString("stringValue");
-            if (stringValue != null) {
-                code = BeautyParamApplier.setString(handle, key, stringValue);
-            } else {
-                double value = options.getDoubleValue("value");
-                boolean special = isSpecialAlgoBeautyKey(key);
-                final int h = handle;
-                final String k = key;
-                final double v = value;
-                if (special) {
-                    // 对齐 iOS performWithSharedGLLock：与 DualInput 串行写参，禁止超时落到裸线程
-                    final int[] codeBox = { -1 };
-                    runOnNamaGlSync(() ->
-                            codeBox[0] = BeautyParamApplier.applySpecialAlgoParam(h, k, v));
-                    code = codeBox[0];
-                } else {
-                    code = BeautyParamApplier.setDouble(handle, key, value);
-                }
-                double got = 0;
-                try {
-                    got = faceunity.fuItemGetParam(handle, key);
-                } catch (Throwable ignored) {
-                }
-                JSONObject dataOut = new JSONObject();
-                dataOut.put("ret", code);
-                if (special) {
-                    double skinseg = 0;
-                    double delspotOff = 0;
-                    int m0 = 0, m1 = 0, m2 = 0, m3 = 0;
-                    try {
-                        skinseg = faceunity.fuItemGetParam(handle, "enable_skinseg");
-                        delspotOff = faceunity.fuItemGetParam(handle, "disable_delspot");
-                        m0 = faceunity.fuGetModuleCode(0);
-                        m1 = faceunity.fuGetModuleCode(1);
-                        m2 = faceunity.fuGetModuleCode(2);
-                        m3 = faceunity.fuGetModuleCode(3);
-                    } catch (Throwable ignored) {
-                    }
-                    dataOut.put("key", key);
-                    dataOut.put("set", value);
-                    dataOut.put("get", got);
-                    dataOut.put("enable_skinseg", skinseg);
-                    dataOut.put("disable_delspot", delspotOff);
-                    dataOut.put("handle", handle);
-                    dataOut.put("moduleCode0", m0);
-                    dataOut.put("moduleCode1", m1);
-                    dataOut.put("moduleCode2", m2);
-                    dataOut.put("moduleCode3", m3);
-                    String nativeDiag = "[NamaNative] special key=" + key
-                            + " set=" + value + " get=" + got + " ret=" + code
-                            + " skinseg=" + skinseg
-                            + " disable_delspot=" + delspotOff
-                            + " handle=" + handle
-                            + " module=[" + m0 + "," + m1 + "," + m2 + "," + m3 + "]";
-                    dataOut.put("nativeDiag", nativeDiag);
-                    Log.i(TAG, nativeDiag);
-                }
-                callback.invoke(success(dataOut));
-                return;
-            }
-            callback.invoke(success(code));
-        } catch (Exception e) {
-            callback.invoke(fail(e.getMessage()));
-        }
+        callback.invoke(NamaSdkManager.setParam(options, overlayCameraView));
     }
 
     @UniJSMethod(uiThread = true)
@@ -738,41 +468,6 @@ public class NamaModule extends UniModule {
         }
         try {
             ensureInitialized();
-            boolean hostedOnly = options.getBooleanValue("hostedOnly");
-            // nvue <beauty-camera> 托管：只恢复预览，不挂 decor 叠层
-            if (cameraHostedByComponent && overlayCameraView != null) {
-                int width = options.getIntValue("width");
-                int height = options.getIntValue("height");
-                if (width > 0 && height > 0) {
-                    Activity act = resolveHostActivity();
-                    float density = act != null ? act.getResources().getDisplayMetrics().density : 3f;
-                    overlayCameraView.bindLayoutSize(
-                            cssToPhysical(density, width),
-                            cssToPhysical(density, height)
-                    );
-                } else {
-                    int vw = overlayCameraView.getWidth();
-                    int vh = overlayCameraView.getHeight();
-                    if (vw > 32 && vh > 32) {
-                        overlayCameraView.bindLayoutSize(vw, vh);
-                    }
-                }
-                overlayCameraView.setVisibility(View.VISIBLE);
-                unparkCameraOverlay();
-                // unpark 已 resumePreview / resumeGlAfterHandoff，勿再调一次
-                JSONObject data = new JSONObject();
-                data.put("hosted", true);
-                data.put("cameraError", BeautyCameraGLView.getLastError());
-                data.put("diag", BeautyCameraGLView.getPreviewDiag());
-                callback.invoke(success(data));
-                return;
-            }
-            // nvue 页必须等组件挂好：绝不能再走 decor + ZOrderOnTop，否则会黑屏盖住全部 UI
-            if (hostedOnly) {
-                Log.e(TAG, "showCamera hostedOnly but component not ready");
-                callback.invoke(fail("hosted camera not ready"));
-                return;
-            }
             int x = options.getIntValue("x");
             int y = options.getIntValue("y");
             int width = options.getIntValue("width");
@@ -782,6 +477,30 @@ public class NamaModule extends UniModule {
                 return;
             }
             // 已有相机层时只改 LayoutParams，避免 destroy → fuOnDeviceLostSafe 弄失效美颜 handle
+            if (overlayCameraView != null && overlayCameraHost != null) {
+                // 安全检查：若 overlay 来自已销毁的 Activity，清理 stale 引用后走重建
+                boolean staleView = false;
+                try {
+                    if (overlayCameraView.getContext() instanceof Activity) {
+                        Activity oldAct = (Activity) overlayCameraView.getContext();
+                        if (oldAct.isFinishing() || oldAct.isDestroyed()) {
+                            staleView = true;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (staleView) {
+                    sPreserveCameraEglOnPark = true;
+                    try {
+                        overlayCameraView.destroyPreview();
+                    } catch (Throwable ignored) {
+                    }
+                    overlayCameraView = null;
+                    overlayCameraHost = null;
+                    previewChromeView = null;
+                    beautyPanelView = null;
+                }
+            }
             if (overlayCameraView != null && overlayCameraHost != null) {
                 Activity act = resolveHostActivity();
                 if (act == null) {
@@ -811,7 +530,7 @@ public class NamaModule extends UniModule {
                         int ah = Math.max(previewBox.getHeight(), pxH);
                         if (overlayCameraView != null) {
                             overlayCameraView.bindLayoutSize(aw, ah);
-                            if (!resizeOnlyBind) {
+                            if (!resizeOnlyBind && !sPreserveCameraEglOnPark) {
                                 try {
                                     if (overlayCameraView.getHolder() != null) {
                                         overlayCameraView.getHolder().setFixedSize(aw, ah);
@@ -929,6 +648,7 @@ public class NamaModule extends UniModule {
             boxLp.topMargin = pxY;
             host.addView(previewBox, boxLp);
 
+            resetParkedBoxCache();
             BeautyCameraGLView view = new BeautyCameraGLView(activity);
             previewBox.addView(view, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -990,6 +710,7 @@ public class NamaModule extends UniModule {
         try {
             // 进后台/多任务：冻帧停采集，勿 park 出屏（否则系统缩略图黑屏）
             if (overlayCameraView != null) {
+                sPausedExposureUi = overlayCameraView.getLastExposureUi();
                 overlayCameraView.freezePreview();
             }
             dismissFocusHud();
@@ -1043,9 +764,13 @@ public class NamaModule extends UniModule {
             if (options != null && options.containsKey("keepSession")) {
                 keepSession = options.getBooleanValue("keepSession");
             }
-            // keepSession=true：只隐藏显示（soft hide），不拆 GL、不输出黑帧
-            // keepSession=false：拆除 overlay（离开美颜页 / 强制重建）
-            if (keepSession) {
+            boolean detach = options != null && options.getBooleanValue("detach");
+            // detach：从窗口拆掉 overlay，保留 SDK（脏会话离开，禁止留下暂停帧）
+            // keepSession=true：只 soft-hide，不拆 GL
+            // keepSession=false：拆除 overlay + deviceLost
+            if (detach) {
+                hideCameraInternal(true, () -> callback.invoke(success(0)));
+            } else if (keepSession) {
                 softHideCameraOverlay(() -> callback.invoke(success(0)));
             } else {
                 hideCameraInternal(false, () -> callback.invoke(success(0)));
@@ -1066,8 +791,8 @@ public class NamaModule extends UniModule {
         try {
             boolean hidden = options != null && options.getBooleanValue("hidden");
             if (hidden) {
-                // 相机：勿 GONE（会毁 Surface/EGL → 回页黑屏无美颜）；移出屏幕外隐藏
-                parkCameraOverlayHidden(false);
+                // 相机：停采 + 移出屏幕（老 vivo ZOrderOnTop 不跟 alpha，须 hidePreview）
+                parkCameraOverlayHidden(true);
                 // 仅当调用方明确要藏视频时才 GONE；媒体页进视频前也会调 hidden=true，
                 // 若与 mount 竞态会把刚挂上的视频藏掉 → 黑屏。视频改由 destroyVideoPreview 拆除。
             } else {
@@ -1147,7 +872,6 @@ public class NamaModule extends UniModule {
                 BeautyVideoGLView.setBeautyEnabledGlobal(enabled);
                 if (overlayVideoView != null) {
                     overlayVideoView.setBeautyEnabled(enabled);
-                    overlayVideoView.requestRender();
                 }
             }
             callback.invoke(success(enabled ? 1 : 0));
@@ -1267,9 +991,9 @@ public class NamaModule extends UniModule {
             exposure = 50;
         }
         overlayCameraView.tapToFocus(localCssX, localCssY, previewW, previewH);
-        // 点按对焦沿用相机记住的曝光，避免 Home 回前台后 chrome 默认值覆盖成「随机」
+        // 用户已调过曝光（含 UI=0 最低档）时始终沿用相机记忆值，勿被 chrome 默认 50 覆盖
         int ev = overlayCameraView.getLastExposureUi();
-        if (ev == 50 && exposure != 50) {
+        if (!overlayCameraView.isExposureLockedByUser() && ev == 50 && exposure != 50) {
             ev = exposure;
         }
         overlayCameraView.setExposureCompensation(ev);
@@ -1303,14 +1027,18 @@ public class NamaModule extends UniModule {
                 callback.invoke(fail("相机未挂载"));
                 return;
             }
-            int exposure = options != null ? options.getIntValue("exposure") : 50;
-            if (options != null && options.containsKey("value") && !options.containsKey("exposure")) {
-                // 兼容 iOS setExposureBias：value 为 -1~1 或 0~1，映射到 0~100
-                double v = options.getDoubleValue("value");
-                if (v >= -1.0 && v <= 1.0) {
-                    exposure = (int) Math.round((v + 1.0) * 50.0);
-                } else {
-                    exposure = (int) Math.round(v);
+            int exposure = 50;
+            if (options != null) {
+                if (options.containsKey("exposure")) {
+                    exposure = options.getIntValue("exposure");
+                } else if (options.containsKey("value")) {
+                    // 兼容 iOS setExposureBias：value 为 -1~1 或 0~1，映射到 0~100
+                    double v = options.getDoubleValue("value");
+                    if (v >= -1.0 && v <= 1.0) {
+                        exposure = (int) Math.round((v + 1.0) * 50.0);
+                    } else {
+                        exposure = (int) Math.round(v);
+                    }
                 }
             }
             exposure = Math.max(0, Math.min(100, exposure));
@@ -1391,7 +1119,6 @@ public class NamaModule extends UniModule {
             int pxH = cssToPhysical(density, previewH);
             syncPreviewChromeLayout(pxX, pxY, pxW, pxH);
             setPreviewTipsEnabled(true);
-            ensureTipsOverlay(activity);
             if (callback != null) {
                 callback.invoke(success(0));
             }
@@ -1471,7 +1198,6 @@ public class NamaModule extends UniModule {
             cfg.put("devicePerfLevel", MediaFuSetup.getDevicePerformanceLevel());
             beautyPanelView.applyConfig(cfg);
             setPreviewTipsEnabled(true);
-            ensureTipsOverlay(activity);
             syncBeautyPanelLayout(activity);
             int ht = beautyPanelView.getCurrentPanelHeightPx();
             applyBeautyPanelBottomInset(ht);
@@ -1676,7 +1402,7 @@ public class NamaModule extends UniModule {
                 public void onWhiteningMode(String mode) {
                     final double skinseg = "skin".equals(mode) ? 1.0 : 0.0;
                     // Demo：enableSkinSegmentation + 同一 color_level；对齐 iOS 写参并回写美白强度即时生效
-                    NamaRenderLock.runExclusive(() -> {
+                    NamaGlExecutor.runExclusive(() -> {
                         int handle = resolvePanelBeautyHandle();
                         if (handle <= 0) {
                             return;
@@ -1877,11 +1603,6 @@ public class NamaModule extends UniModule {
     }
 
     private void ensureMediaBackButton(Activity activity) {
-        View decor = activity.getWindow().getDecorView();
-        if (!(decor instanceof FrameLayout)) {
-            return;
-        }
-        FrameLayout parent = (FrameLayout) decor;
         if (mediaBackBtn == null) {
             mediaBackBtn = new FrameLayout(activity);
             mediaBackBtn.setBackground(null);
@@ -1898,25 +1619,46 @@ public class NamaModule extends UniModule {
                     FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
             mediaBackBtn.setOnClickListener(v -> fireBeautyPanelEvent("back", null));
         }
-        if (mediaBackBtn.getParent() != parent) {
-            if (mediaBackBtn.getParent() instanceof ViewGroup) {
-                ((ViewGroup) mediaBackBtn.getParent()).removeView(mediaBackBtn);
+        int topSafe = 0;
+        try {
+            if (Build.VERSION.SDK_INT >= 23) {
+                android.view.WindowInsets insets = activity.getWindow().getDecorView().getRootWindowInsets();
+                if (insets != null) {
+                    topSafe = insets.getSystemWindowInsetTop();
+                }
             }
-            parent.addView(mediaBackBtn);
+        } catch (Throwable ignored) {
         }
-        layoutMediaBackButton(activity);
+        if (topSafe < dpToPx(20)) {
+            topSafe = dpToPx(44);
+        }
+        int size = dpToPx(44);
+        int left = dpToPx(10);
+        int top = topSafe + dpToPx(8);
+
+        if (mediaBackPopup == null || !mediaBackPopup.isShowing()) {
+            int[] loc = new int[2];
+            mediaBackPopup = new PopupWindow(mediaBackBtn, size, size, false);
+            mediaBackPopup.setClippingEnabled(false);
+            mediaBackPopup.setFocusable(false);
+            mediaBackPopup.setOutsideTouchable(false);
+            try {
+                mediaBackPopup.showAtLocation(activity.getWindow().getDecorView(),
+                        Gravity.TOP | Gravity.START, left, top);
+            } catch (Throwable t) {
+                Log.w(TAG, "ensureMediaBackButton showAtLocation", t);
+            }
+        } else {
+            try {
+                mediaBackPopup.update(left, top, size, size);
+            } catch (Throwable ignored) {
+            }
+        }
         mediaBackBtn.setVisibility(View.VISIBLE);
-        parent.bringChildToFront(mediaBackBtn);
-        if (overlayVideoHost != null) {
-            parent.bringChildToFront(overlayVideoHost);
-        }
-        if (beautyPanelPopup != null && beautyPanelPopup.isShowing()) {
-            // PopupWindow 在 decor 上层，返回键需在 Popup 之下由 decor child order 保证可点
-        }
     }
 
     private void layoutMediaBackButton(Activity activity) {
-        if (mediaBackBtn == null || mediaBackBtn.getParent() == null) {
+        if (mediaBackBtn == null) {
             return;
         }
         int topSafe = 0;
@@ -1933,15 +1675,24 @@ public class NamaModule extends UniModule {
             topSafe = dpToPx(44);
         }
         int size = dpToPx(44);
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(size, size);
-        lp.gravity = Gravity.TOP | Gravity.START;
-        lp.leftMargin = dpToPx(10);
-        lp.topMargin = topSafe + dpToPx(8);
-        mediaBackBtn.setLayoutParams(lp);
-        mediaBackBtn.setElevation(24f);
+        int left = dpToPx(10);
+        int top = topSafe + dpToPx(8);
+        if (mediaBackPopup != null && mediaBackPopup.isShowing()) {
+            try {
+                mediaBackPopup.update(left, top, size, size);
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     private static void hideMediaBackButton() {
+        if (mediaBackPopup != null) {
+            try {
+                mediaBackPopup.dismiss();
+            } catch (Throwable ignored) {
+            }
+            mediaBackPopup = null;
+        }
         if (mediaBackBtn != null) {
             mediaBackBtn.setVisibility(View.GONE);
             if (mediaBackBtn.getParent() instanceof ViewGroup) {
@@ -1977,7 +1728,11 @@ public class NamaModule extends UniModule {
         if (handle <= 0) {
             return;
         }
-        boolean special = isSpecialAlgoBeautyKey(key);
+        boolean special = "body_blur_level".equals(key)
+                || "delspot_level".equals(key)
+                || "facial_plump".equals(key)
+                || "intensity_eye_pupil".equals(key)
+                || "enable_skinseg".equals(key);
         // 对齐 iOS：在相机 GL 线程写参（亮眼等须在 fuRender 前落地）
         Runnable apply = () -> {
             try {
@@ -1993,7 +1748,7 @@ public class NamaModule extends UniModule {
         if (overlayCameraView != null) {
             runOnNamaGl(apply);
         } else {
-            NamaRenderLock.runExclusive(apply);
+            NamaGlExecutor.runExclusive(apply);
         }
         refreshPausedVideoBeautyIfNeeded();
         if (overlayCameraView != null) {
@@ -2004,14 +1759,17 @@ public class NamaModule extends UniModule {
     private int resolvePanelBeautyHandle() {
         // 导入视频叠层：优先 media handle，避免写到相机道具而预览仍用 media
         if (overlayVideoView != null || overlayVideoHost != null) {
-            int media = mediaBeautyItemHandle > 0 ? mediaBeautyItemHandle : FuBeautyHandle.mediaHandle;
+            int media = NamaSdkManager.getMediaBeautyHandle() > 0
+                    ? NamaSdkManager.getMediaBeautyHandle() : FuBeautyHandle.mediaHandle;
             if (media > 0) {
                 return media;
             }
         }
-        int handle = beautyItemHandle > 0 ? beautyItemHandle : FuBeautyHandle.cameraHandle;
+        int handle = NamaSdkManager.getCameraBeautyHandle() > 0
+                ? NamaSdkManager.getCameraBeautyHandle() : FuBeautyHandle.cameraHandle;
         if (handle <= 0) {
-            handle = mediaBeautyItemHandle > 0 ? mediaBeautyItemHandle : FuBeautyHandle.mediaHandle;
+            handle = NamaSdkManager.getMediaBeautyHandle() > 0
+                    ? NamaSdkManager.getMediaBeautyHandle() : FuBeautyHandle.mediaHandle;
         }
         return handle;
     }
@@ -2042,112 +1800,15 @@ public class NamaModule extends UniModule {
 
     /** 非关键写参：异步投递到相机 GL（可丢）。 */
     private void runOnNamaGl(Runnable action) {
-        if (action == null) {
-            return;
-        }
-        BeautyCameraGLView cam = overlayCameraView;
-        if (cam != null) {
-            try {
-                cam.queueEvent(() -> {
-                    try {
-                        NamaRenderLock.runExclusive(action);
-                    } catch (Throwable t) {
-                        Log.w(TAG, "runOnNamaGl", t);
-                    }
-                });
-                cam.requestRender();
-                return;
-            } catch (Throwable t) {
-                Log.w(TAG, "runOnNamaGl queue", t);
-            }
-        }
-        try {
-            NamaRenderLock.runExclusive(action);
-        } catch (Throwable t) {
-            Log.w(TAG, "runOnNamaGl direct", t);
-        }
+        NamaGlExecutor.runAsync(overlayCameraView, action);
     }
 
     /**
-     * 特殊算法写参：同步等待 GL 队列执行，与 DualInput 共用 {@link NamaRenderLock}。
+     * 特殊算法写参：同步等待 GL 队列执行，与 DualInput 共用全局 Nama 锁。
      * 对齐 iOS performWithSharedGLLock；禁止超时后无锁裸写（会导致 get=set 无画面效果）。
      */
     private void runOnNamaGlSync(Runnable action) {
-        if (action == null) {
-            return;
-        }
-        BeautyCameraGLView cam = overlayCameraView;
-        if (cam != null) {
-            final Object waitLock = new Object();
-            final boolean[] done = { false };
-            final int prevMode = cam.getRenderMode();
-            try {
-                // WHEN_DIRTY 时强制刷一帧，避免 queueEvent 迟迟不跑
-                cam.setRenderMode(BeautyCameraGLView.RENDERMODE_CONTINUOUSLY);
-                cam.queueEvent(() -> {
-                    try {
-                        NamaRenderLock.runExclusive(action);
-                    } catch (Throwable t) {
-                        Log.w(TAG, "runOnNamaGlSync gl", t);
-                    } finally {
-                        synchronized (waitLock) {
-                            done[0] = true;
-                            waitLock.notifyAll();
-                        }
-                    }
-                });
-                cam.requestRender();
-                long deadline = System.currentTimeMillis() + 2000L;
-                synchronized (waitLock) {
-                    while (!done[0] && System.currentTimeMillis() < deadline) {
-                        try {
-                            waitLock.wait(16);
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
-                    }
-                }
-            } catch (Throwable t) {
-                Log.w(TAG, "runOnNamaGlSync queue", t);
-            } finally {
-                try {
-                    cam.setRenderMode(prevMode);
-                } catch (Throwable ignored) {
-                }
-            }
-            if (done[0]) {
-                return;
-            }
-            Log.w(TAG, "runOnNamaGlSync timeout → SharedEgl/exclusive fallback");
-        }
-        // 无相机或队列超时：仍在 NamaRenderLock 内写（必要时 makeCurrent SharedEgl）
-        try {
-            NamaRenderLock.runExclusive(() -> {
-                boolean made = false;
-                try {
-                    SharedEglRoot.makeCurrent();
-                    made = true;
-                } catch (Throwable ignored) {
-                }
-                try {
-                    action.run();
-                } finally {
-                    if (made) {
-                        try {
-                            android.opengl.EGL14.eglMakeCurrent(
-                                    SharedEglRoot.getDisplay(),
-                                    android.opengl.EGL14.EGL_NO_SURFACE,
-                                    android.opengl.EGL14.EGL_NO_SURFACE,
-                                    android.opengl.EGL14.EGL_NO_CONTEXT);
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                }
-            });
-        } catch (Throwable t) {
-            Log.w(TAG, "runOnNamaGlSync fallback", t);
-        }
+        NamaGlExecutor.runSync(overlayCameraView, action);
     }
 
     private void applyBeautyPanelFilter(String filterKey) {
@@ -2156,7 +1817,7 @@ public class NamaModule extends UniModule {
         }
         final String key = filterKey;
         // 先同步写滤镜名/强度，再重绘暂停帧，避免 requestRender 抢在 setParam 之前
-        NamaRenderLock.runExclusive(() -> {
+        NamaGlExecutor.runExclusive(() -> {
             int handle = resolvePanelBeautyHandle();
             if (handle <= 0) {
                 return;
@@ -2165,15 +1826,20 @@ public class NamaModule extends UniModule {
                 BeautyParamApplier.setString(handle, "filter_name", key);
                 double level = -1;
                 if (beautyPanelView != null) {
-                    level = beautyPanelView.peekSdkParamValue("filter_level");
+                    String fid = beautyPanelView.getSelectedFilterId();
+                    level = beautyPanelView.peekFilterSdkLevel(fid);
                 }
-                if (level < 0) {
-                    level = 0.4;
+        if (level < 0) {
+                    // 未单独调过：仅切 filter_name，不写 filter_level（对齐 iOS，避免用全局强度覆盖）
+                    if ("origin".equalsIgnoreCase(key) || "filter_origin".equalsIgnoreCase(key)) {
+                        BeautyParamApplier.setDouble(handle, "filter_level", 0);
+                    }
+                } else {
+                    if ("origin".equalsIgnoreCase(key) || "filter_origin".equalsIgnoreCase(key)) {
+                        level = 0;
+                    }
+                    BeautyParamApplier.setDouble(handle, "filter_level", level);
                 }
-                if ("origin".equalsIgnoreCase(key) || "filter_origin".equalsIgnoreCase(key)) {
-                    level = 0;
-                }
-                BeautyParamApplier.setDouble(handle, "filter_level", level);
             } catch (Throwable t) {
                 Log.w(TAG, "applyBeautyPanelFilter", t);
             }
@@ -2731,20 +2397,21 @@ public class NamaModule extends UniModule {
             }
             String path = options.getString("path");
             // 优先媒体 handle；未绑定时复用相机 handle（首页/相机已 init，只换输入源）
-            int handle = mediaBeautyItemHandle > 0 ? mediaBeautyItemHandle : FuBeautyHandle.mediaHandle;
+            int handle = NamaSdkManager.getMediaBeautyHandle() > 0
+                    ? NamaSdkManager.getMediaBeautyHandle() : FuBeautyHandle.mediaHandle;
             if (handle <= 0) {
-                handle = beautyItemHandle > 0 ? beautyItemHandle : FuBeautyHandle.cameraHandle;
+                handle = NamaSdkManager.getCameraBeautyHandle() > 0
+                        ? NamaSdkManager.getCameraBeautyHandle() : FuBeautyHandle.cameraHandle;
             }
             if (handle <= 0) {
                 callback.invoke(fail("请先 loadBundle"));
                 return;
             }
-            if (mediaBeautyItemHandle <= 0 && handle > 0) {
-                mediaBeautyItemHandle = handle;
-                FuBeautyHandle.setPipelineHandle(true, handle);
+            if (NamaSdkManager.getMediaBeautyHandle() <= 0 && handle > 0) {
+                NamaSdkManager.setMediaBeautyHandle(handle);
             }
             Activity activity = resolveHostActivity();
-            File cacheDir = null;
+            java.io.File cacheDir = null;
             if (activity != null) {
                 cacheDir = activity.getCacheDir();
             }
@@ -2861,6 +2528,9 @@ public class NamaModule extends UniModule {
             sCameraGlHandedOff = false;
             // 冷启动直进导入视频：无相机叠层则建驻留 GL，否则首帧无美颜
             ensureParkedNamaGlForMedia(activity);
+            if (overlayCameraView != null) {
+                overlayCameraView.enterVideoBeautyHosting();
+            }
             destroyVideoPreviewInternal(true, () ->
                     softHideCameraOverlay(() -> mountVideoOverlay(activity, opts, cb)));
         } catch (Exception e) {
@@ -2875,6 +2545,8 @@ public class NamaModule extends UniModule {
         if (activity == null || overlayCameraView != null) {
             if (overlayCameraView != null) {
                 overlayCameraView.armVideoStillMatrix();
+                overlayCameraView.enterVideoBeautyHosting();
+                wakeGlSurfaceView(overlayCameraView, activity);
             }
             return;
         }
@@ -2887,7 +2559,8 @@ public class NamaModule extends UniModule {
             attachOverlayHostOnDecor(root, host);
 
             FrameLayout previewBox = new FrameLayout(activity);
-            FrameLayout.LayoutParams boxLp = new FrameLayout.LayoutParams(dpToPx(64), dpToPx(64));
+            int parkedSide = DeviceQuirk.isHuaweiFamily() ? dpToPx(320) : dpToPx(128);
+            FrameLayout.LayoutParams boxLp = new FrameLayout.LayoutParams(parkedSide, parkedSide);
             boxLp.leftMargin = 100000;
             boxLp.topMargin = 0;
             host.addView(previewBox, boxLp);
@@ -2902,17 +2575,19 @@ public class NamaModule extends UniModule {
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
             ));
-            view.bindLayoutSize(dpToPx(64), dpToPx(64));
+            view.bindLayoutSize(parkedSide, parkedSide);
             overlayCameraView = view;
             overlayCameraHost = host;
-            cameraHostedByComponent = false;
-            // 不打开摄像头，只保留 EGL 供视频帧 Nama
+            // 先进入视频宿主再 hide，避免华为 coverHidden 卡死 GL
+            view.enterVideoBeautyHosting();
             view.hidePreview();
             host.setAlpha(0f);
-            host.setEnabled(false);
+            host.setEnabled(true);
+            host.setVisibility(View.VISIBLE);
             view.setAlpha(0f);
-            view.armVideoStillMatrix();
-            Log.i(TAG, "ensureParkedNamaGlForMedia created");
+            view.setVisibility(View.VISIBLE);
+            wakeGlSurfaceView(view, activity);
+            Log.i(TAG, "ensureParkedNamaGlForMedia created parked=" + parkedSide);
         } catch (Throwable t) {
             Log.w(TAG, "ensureParkedNamaGlForMedia", t);
         }
@@ -2920,17 +2595,18 @@ public class NamaModule extends UniModule {
 
     private void mountVideoOverlay(Activity activity, JSONObject options, UniJSCallback callback) {
         try {
-            int beautyHandle = mediaBeautyItemHandle > 0 ? mediaBeautyItemHandle : FuBeautyHandle.mediaHandle;
+            int beautyHandle = NamaSdkManager.getMediaBeautyHandle() > 0
+                    ? NamaSdkManager.getMediaBeautyHandle() : FuBeautyHandle.mediaHandle;
             if (beautyHandle <= 0) {
-                beautyHandle = beautyItemHandle > 0 ? beautyItemHandle : FuBeautyHandle.cameraHandle;
+                beautyHandle = NamaSdkManager.getCameraBeautyHandle() > 0
+                        ? NamaSdkManager.getCameraBeautyHandle() : FuBeautyHandle.cameraHandle;
             }
             if (beautyHandle <= 0) {
                 callback.invoke(fail("美颜 handle 无效，请先在首页/相机完成 init+loadBundle"));
                 return;
             }
-            if (mediaBeautyItemHandle <= 0) {
-                mediaBeautyItemHandle = beautyHandle;
-                FuBeautyHandle.setPipelineHandle(true, beautyHandle);
+            if (NamaSdkManager.getMediaBeautyHandle() <= 0) {
+                NamaSdkManager.setMediaBeautyHandle(beautyHandle);
             }
             String path = options.getString("path");
             int x = options.getIntValue("x");
@@ -2962,6 +2638,7 @@ public class NamaModule extends UniModule {
                     ViewGroup.LayoutParams.MATCH_PARENT
             ));
             view.bindLayoutSize(pxW, pxH);
+            wakeGlSurfaceView(view, activity);
             MediaFuSetup.ensureBeautyOn(beautyHandle);
             MediaFuSetup.enableAdvancedBeautyRuntime(beautyHandle);
             try {
@@ -2971,14 +2648,15 @@ public class NamaModule extends UniModule {
             // 视频美颜矩阵必须在相机 GL 线程用 StillLike；此处禁止 UI 线程写 identity
             ensureParkedNamaGlForMedia(activity);
             if (overlayCameraView != null) {
-                overlayCameraView.armVideoStillMatrix();
+                wakeGlSurfaceView(overlayCameraView, activity);
+                overlayCameraView.enterVideoBeautyHosting();
                 // 预热 GL 队列，避免首帧仍是原片
                 try {
                     overlayCameraView.queueEvent(() -> {
                         try {
                             faceunity.fuOnCameraChange();
                             MediaFuSetup.applyStillLikeBufferMatrix();
-                            faceunity.fuSetFaceProcessorDetectMode(0);
+                            faceunity.fuSetFaceProcessorDetectMode(1);
                         } catch (Throwable ignored) {
                         }
                     });
@@ -3011,12 +2689,16 @@ public class NamaModule extends UniModule {
                     fireVideoEvent("playing", null);
                 } catch (Throwable t) {
                     Log.w(TAG, "video playBtn", t);
+                    try {
+                        playBtn.setVisibility(View.VISIBLE);
+                    } catch (Throwable ignored) {
+                    }
                 }
             });
             overlayVideoPlayBtn = playBtn;
 
-            // 先藏住，等首帧再显；默认暂停 + 中心播放钮（对齐 Demo）
-            view.setVisibility(View.INVISIBLE);
+            // 对齐 Demo：默认暂停；有解码帧即显示（勿等美颜完成，否则华为等一直 INVISIBLE 黑屏）
+            view.setVisibility(View.VISIBLE);
             playBtn.setVisibility(View.GONE);
             view.setOnFirstFrameListener(() -> {
                 try {
@@ -3087,6 +2769,76 @@ public class NamaModule extends UniModule {
         }
     }
 
+    /**
+     * 锁屏/回桌面：只停视频层 + 视频 GL onPause。
+     * 严禁 pause 驻留相机 GL：视频美颜/调参都走相机 GL 的 queueEvent，一 pause 就会卡死无美颜。
+     */
+    @UniJSMethod(uiThread = true)
+    public void parkVideoForBackground(UniJSCallback callback) {
+        if (callback == null) {
+            return;
+        }
+        try {
+            if (overlayVideoView != null) {
+                overlayVideoView.onHostPause();
+            }
+            if (overlayVideoPlayBtn != null) {
+                overlayVideoPlayBtn.setVisibility(View.VISIBLE);
+            }
+            fireVideoEvent("paused", null);
+            callback.invoke(success(0));
+        } catch (Exception e) {
+            callback.invoke(fail(e.getMessage()));
+        }
+    }
+
+    /**
+     * 回前台：先确保驻留相机 Nama GL 醒着，再重置视频为「首帧 + Play」。
+     * 不 invalidate、不 exit hosting。
+     */
+    @UniJSMethod(uiThread = true)
+    public void resetVideoToIdle(UniJSCallback callback) {
+        if (callback == null) {
+            return;
+        }
+        try {
+            JSONObject data = new JSONObject();
+            Activity activity = resolveHostActivity();
+            if (overlayVideoView == null) {
+                data.put("ok", 0);
+                callback.invoke(success(data));
+                return;
+            }
+            // 美颜宿主必须先醒，否则 idle 解一帧 / 之后点播放都会卡在 processVideoRgbaFrame
+            if (overlayCameraView != null) {
+                wakeGlSurfaceView(overlayCameraView, activity);
+                overlayCameraView.enterVideoBeautyHosting();
+                try {
+                    overlayCameraView.queueEvent(() -> {
+                        try {
+                            faceunity.fuOnCameraChange();
+                            MediaFuSetup.applyStillLikeBufferMatrix();
+                            faceunity.fuSetFaceProcessorDetectMode(1);
+                        } catch (Throwable ignored) {
+                        }
+                    });
+                    overlayCameraView.requestRender();
+                } catch (Throwable ignored) {
+                }
+            }
+            boolean ok = overlayVideoView.onHostResumeToIdle();
+            if (overlayVideoPlayBtn != null) {
+                overlayVideoPlayBtn.setVisibility(View.VISIBLE);
+            }
+            bringVideoOverlayToFront();
+            fireVideoEvent("paused", null);
+            data.put("ok", ok ? 1 : 0);
+            callback.invoke(success(data));
+        } catch (Exception e) {
+            callback.invoke(fail(e.getMessage()));
+        }
+    }
+
     @UniJSMethod(uiThread = true)
     public void resumeVideoPreview(UniJSCallback callback) {
         if (callback == null) {
@@ -3122,6 +2874,10 @@ public class NamaModule extends UniModule {
             }
             final boolean keep = keepSession;
             destroyVideoPreviewInternal(keep, () -> {
+                if (overlayCameraView != null) {
+                    overlayCameraView.exitVideoBeautyHosting();
+                    overlayCameraView.reapplyInputCameraMatrix();
+                }
                 JSONObject data = new JSONObject();
                 // 视频显示层拆除不丢 Nama 会话
                 data.put("resourcesLost", false);
@@ -3150,13 +2906,15 @@ public class NamaModule extends UniModule {
                 return;
             }
             String path = options.getString("path");
-            int handle = mediaBeautyItemHandle > 0 ? mediaBeautyItemHandle : FuBeautyHandle.mediaHandle;
+            int handle = NamaSdkManager.getMediaBeautyHandle() > 0
+                    ? NamaSdkManager.getMediaBeautyHandle() : FuBeautyHandle.mediaHandle;
             if (handle <= 0) {
                 callback.invoke(fail("请先 loadBundle(media)"));
                 return;
             }
             Activity activity = resolveHostActivity();
-            // Demo 风格：全屏导出 loading，不黑屏拆会话
+            VideoBeautyProcessor.clearExportCancel();
+            // Demo 风格：全屏导出 loading + 取消（对齐 iOS）
             exportHud = showExportLoadingHud(activity);
             final Object pauseLock = new Object();
             final boolean[] paused = {false};
@@ -3186,7 +2944,7 @@ public class NamaModule extends UniModule {
                     }
                 }
             }
-            File cacheDir = activity != null ? activity.getCacheDir() : null;
+            java.io.File cacheDir = activity != null ? activity.getCacheDir() : null;
             // Nama 挂在相机 GL：必须优先走相机上下文，勿用视频显示层 EGL（易只出一帧）
             final BeautyCameraGLView cameraGl = overlayCameraView;
             final BeautyVideoGLView videoGl = overlayVideoView;
@@ -3223,9 +2981,16 @@ public class NamaModule extends UniModule {
             data.put("path", outPath);
             callback.invoke(success(data));
         } catch (Exception e) {
-            Log.e(TAG, "processVideo", e);
-            callback.invoke(fail(e.getMessage()));
+            String msg = e.getMessage() != null ? e.getMessage() : "导出失败";
+            if (VideoBeautyProcessor.isExportCancelled() || msg.contains("取消")) {
+                Log.i(TAG, "processVideo cancelled");
+                callback.invoke(fail("导出已取消"));
+            } else {
+                Log.e(TAG, "processVideo", e);
+                callback.invoke(fail(msg));
+            }
         } finally {
+            VideoBeautyProcessor.clearExportCancel();
             final View hud = exportHud;
             new Handler(Looper.getMainLooper()).post(() -> {
                 try {
@@ -3253,6 +3018,10 @@ public class NamaModule extends UniModule {
             try {
                 dismissExportLoadingHud(null);
                 FuExportProgressHud root = new FuExportProgressHud(activity);
+                root.setOnCancelListener(() -> {
+                    Log.i(TAG, "export cancel tapped");
+                    VideoBeautyProcessor.requestCancelExport();
+                });
                 PopupWindow popup = new PopupWindow(root,
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT,
@@ -3319,7 +3088,7 @@ public class NamaModule extends UniModule {
     }
 
     private void bringOverlayToFront() {
-        if (cameraHostedByComponent || overlayCameraHost == null) {
+        if (overlayCameraHost == null) {
             return;
         }
         ViewGroup decor = resolveOverlayRoot(resolveHostActivity());
@@ -3394,6 +3163,10 @@ public class NamaModule extends UniModule {
         sAvoidCameraGlForImageAfterVideo = false;
         view.destroyPreviewAsync(true, () -> {
             try {
+                // keepSession：马上挂新视频，勿 exit，否则华为 park 缩 1px → GL 停转黑屏
+                if (!keepSession && overlayCameraView != null) {
+                    overlayCameraView.exitVideoBeautyHosting();
+                }
                 ViewGroup parent = (ViewGroup) view.getParent();
                 if (parent != null) {
                     parent.removeView(view);
@@ -3409,6 +3182,9 @@ public class NamaModule extends UniModule {
             // 复位检测模式（相机 GL 上的 Nama 仍在）
             try {
                 faceunity.fuSetFaceProcessorDetectMode(1);
+                if (overlayCameraView != null) {
+                    overlayCameraView.reapplyInputCameraMatrix();
+                }
             } catch (Throwable ignored) {
             }
             if (onComplete != null) {
@@ -3423,22 +3199,8 @@ public class NamaModule extends UniModule {
             return;
         }
         try {
-            destroyVideoPreviewInternal(false, () -> hideCameraInternal(false, () -> {
-                try {
-                    if (initialized) {
-                        faceunity.fuDestroyAllItems();
-                        faceunity.fuDestroyLibData();
-                    }
-                    initialized = false;
-                    aiModelLoaded = false;
-                    beautyItemHandle = 0;
-                    mediaBeautyItemHandle = 0;
-                    FuBeautyHandle.clearAll();
-                    callback.invoke(success(0));
-                } catch (Exception e) {
-                    callback.invoke(fail(e.getMessage()));
-                }
-            }));
+            destroyVideoPreviewInternal(false, () -> hideCameraInternal(false, () ->
+                    callback.invoke(NamaSdkManager.destroySdk())));
         } catch (Exception e) {
             callback.invoke(fail(e.getMessage()));
         }
@@ -3446,21 +3208,6 @@ public class NamaModule extends UniModule {
 
     private static int cssToPhysical(float density, int css) {
         return (int) (css * density + 0.5f);
-    }
-
-    private void configureFaceProcessor() {
-        int level = MediaFuSetup.getDevicePerformanceLevel();
-        faceunity.fuSetMaxFaces(level >= MediaFuSetup.PERF_EXCELLENT ? 4 : 2);
-        faceunity.fuSetFaceProcessorDetectMode(1);
-        faceunity.fuFaceProcessorSetMinFaceRatio(0.05f);
-        try {
-            faceunity.fuFaceProcessorSetFaceLandmarkQuality(level >= MediaFuSetup.PERF_HIGH ? 1 : 0);
-            faceunity.fuFaceProcessorSetDetectSmallFace(level >= MediaFuSetup.PERF_HIGH ? 1 : 0);
-        } catch (Throwable t) {
-            Log.w(TAG, "configureFaceProcessor quality", t);
-        }
-        Log.e(TAG, "configureFaceProcessor ok maxFaces=" + (level >= MediaFuSetup.PERF_EXCELLENT ? 4 : 2)
-                + " level=" + level);
     }
 
     private void releaseCameraKeepAliveInternal(Runnable onComplete) {
@@ -3506,16 +3253,27 @@ public class NamaModule extends UniModule {
 
     /** @param stopCamera true 时停采集（soft hide / pause）；false 仅藏层（setOverlayWindowsHidden） */
     private void parkCameraOverlayHidden(boolean stopCamera) {
-        if (stopCamera && overlayCameraView != null) {
-            // 默认只停采集、保住 EGL（静图 processOnGlView 仍依赖相机 GL）
-            overlayCameraView.hidePreview();
-            // 导入视频时卸顶，避免盖住视频叠层；勿 INVISIBLE/GONE（会 surfaceDestroyed → 回页黑屏）
-            try {
-                overlayCameraView.setZOrderOnTop(false);
-                overlayCameraView.setZOrderMediaOverlay(false);
-            } catch (Throwable ignored) {
+        if (overlayCameraView != null && stopCamera) {
+            overlayCameraView.enterVideoBeautyHosting();
+        }
+        final boolean keepVideoGlAlive = overlayVideoView != null
+                || (overlayCameraView != null && overlayCameraView.isVideoBeautyHosting());
+        if (overlayCameraView != null) {
+            if (stopCamera) {
+                overlayCameraView.hidePreview();
+            }
+            // 切导航重建 Activity 后禁止改 Z-order：会毁掉 Surface/EGL，第二次进相机美颜失效。
+            // 老 vivo 仍须卸顶，否则 Surface 不跟 parent 平移会挡住下一页。
+            if (!sPreserveCameraEglOnPark) {
+                try {
+                    overlayCameraView.setZOrderOnTop(false);
+                    overlayCameraView.setZOrderMediaOverlay(false);
+                } catch (Throwable ignored) {
+                }
             }
         }
+        final boolean aggressive = DeviceQuirk.needsAggressiveSurfaceHide()
+                || sPreserveCameraEglOnPark;
         // ZOrderOnTop：把 previewBox 移出屏幕 + alpha，保持 VISIBLE 以保住 Surface/EGL
         if (overlayCameraHost != null && overlayCameraHost.getChildCount() > 0) {
             View previewBox = overlayCameraHost.getChildAt(0);
@@ -3530,24 +3288,74 @@ public class NamaModule extends UniModule {
                 }
                 boxLp.leftMargin = 100000;
                 boxLp.topMargin = 0;
+                // 老机 Surface 不跟 margin：必须缩到小块，否则全屏黑 Surface 盖住导入视频（P20 Pro 黑屏主因）
+                if (aggressive && !keepVideoGlAlive) {
+                    boxLp.width = 1;
+                    boxLp.height = 1;
+                } else if (aggressive && keepVideoGlAlive) {
+                    // 保留小块 EGL 给视频美颜；绝不能沿用全屏 sParkedBoxW/H
+                    int parked = DeviceQuirk.isHuaweiFamily() ? dpToPx(320) : dpToPx(128);
+                    boxLp.width = parked;
+                    boxLp.height = parked;
+                }
                 previewBox.setLayoutParams(boxLp);
+                if (aggressive && keepVideoGlAlive && overlayCameraView != null) {
+                    try {
+                        overlayCameraView.bindLayoutSize(boxLp.width, boxLp.height);
+                    } catch (Throwable ignored) {
+                    }
+                }
             }
         }
         if (overlayCameraHost != null) {
             overlayCameraHost.setAlpha(0f);
-            overlayCameraHost.setEnabled(false);
-            overlayCameraHost.setVisibility(View.VISIBLE);
+            overlayCameraHost.setEnabled(keepVideoGlAlive);
+            if (aggressive && !keepVideoGlAlive) {
+                overlayCameraHost.setVisibility(View.INVISIBLE);
+            } else {
+                overlayCameraHost.setVisibility(View.VISIBLE);
+            }
             if (overlayCameraView != null) {
-                overlayCameraView.setVisibility(View.VISIBLE);
                 overlayCameraView.setAlpha(0f);
+                if (aggressive && !keepVideoGlAlive) {
+                    overlayCameraView.setVisibility(View.INVISIBLE);
+                } else {
+                    overlayCameraView.setVisibility(View.VISIBLE);
+                }
+                if (keepVideoGlAlive) {
+                    overlayCameraView.enterVideoBeautyHosting();
+                }
             }
         } else if (overlayCameraView != null) {
             overlayCameraView.setTranslationX(4096f);
             overlayCameraView.setAlpha(0f);
-            overlayCameraView.setVisibility(View.VISIBLE);
+            if (aggressive && !keepVideoGlAlive) {
+                overlayCameraView.setVisibility(View.INVISIBLE);
+            } else {
+                overlayCameraView.setVisibility(View.VISIBLE);
+            }
+            if (keepVideoGlAlive) {
+                overlayCameraView.enterVideoBeautyHosting();
+            }
         }
         dismissPreviewChrome();
         dismissBeautyPanel();
+        Log.i(TAG, "parkCameraOverlayHidden stopCamera=" + stopCamera
+                + " aggressive=" + aggressive + " keepVideoGl=" + keepVideoGlAlive);
+    }
+
+    /** 动态加入的 GLSurfaceView 须 onResume，否则 GL 线程不跑（华为视频黑屏主因之一） */
+    private static void wakeGlSurfaceView(GLSurfaceView view, Activity activity) {
+        if (view == null || activity == null || activity.isFinishing()) {
+            return;
+        }
+        try {
+            view.setVisibility(View.VISIBLE);
+            view.onResume();
+            view.requestRender();
+        } catch (Throwable t) {
+            Log.w(TAG, "wakeGlSurfaceView", t);
+        }
     }
 
     private void unparkCameraOverlay() {
@@ -3591,11 +3399,12 @@ public class NamaModule extends UniModule {
             overlayCameraView.setTranslationX(0f);
             overlayCameraView.setAlpha(1f);
             overlayCameraView.setVisibility(View.VISIBLE);
-            try {
-                // 恢复盖在 WebView 上的取景叠层
-                overlayCameraView.setZOrderMediaOverlay(true);
-                overlayCameraView.setZOrderOnTop(true);
-            } catch (Throwable ignored) {
+            if (!sPreserveCameraEglOnPark) {
+                try {
+                    overlayCameraView.setZOrderMediaOverlay(true);
+                    overlayCameraView.setZOrderOnTop(true);
+                } catch (Throwable ignored) {
+                }
             }
             // 仅视频交接后才 resumeGlAfterHandoff；soft-hide 只 resumePreview，避免无配对 onPause 的 onResume 黑屏
             if (sCameraGlHandedOff) {
@@ -3605,8 +3414,13 @@ public class NamaModule extends UniModule {
                 overlayCameraView.resumePreview();
             }
             try {
-                if (previewChromeView != null) {
-                    previewChromeView.setFocusExposure(overlayCameraView.getLastExposureUi());
+                if (previewChromeView != null && overlayCameraView != null) {
+                    int ev = sPausedExposureUi >= 0
+                            ? sPausedExposureUi
+                            : overlayCameraView.getLastExposureUi();
+                    sPausedExposureUi = -1;
+                    overlayCameraView.setExposureCompensation(ev);
+                    previewChromeView.setFocusExposure(ev);
                 }
             } catch (Throwable ignored) {
             }
@@ -3618,34 +3432,9 @@ public class NamaModule extends UniModule {
         dismissFocusHud();
         if (overlayCameraView == null) {
             resetOverlayLayoutCache();
-            cameraHostedByComponent = false;
             if (onComplete != null) {
                 onComplete.run();
             }
-            return;
-        }
-        // 组件托管：只销毁预览资源，不 removeView（组件仍持有 host）
-        if (cameraHostedByComponent && overlayCameraHost == null) {
-            final BeautyCameraGLView view = overlayCameraView;
-            final boolean keep = keepSession;
-            view.setVisibility(View.VISIBLE);
-            if (keep) {
-                // 保留会话：仍须等本 View GL 释放完，避免与导入 processImage / 新相机抢 EGL
-                view.destroyPreviewAsync(true, () -> {
-                    resetOverlayLayoutCache();
-                    if (onComplete != null) {
-                        onComplete.run();
-                    }
-                });
-                return;
-            }
-            view.destroyPreviewAsync(false, () -> {
-                markNamaResourcesLost("hideCamera-hosted");
-                resetOverlayLayoutCache();
-                if (onComplete != null) {
-                    onComplete.run();
-                }
-            });
             return;
         }
         final BeautyCameraGLView view = overlayCameraView;
@@ -3653,7 +3442,6 @@ public class NamaModule extends UniModule {
         final boolean keep = keepSession;
         overlayCameraView = null;
         overlayCameraHost = null;
-        cameraHostedByComponent = false;
 
         // 立刻从层级移除，用户马上看到下层页面，不再等 GL destroy
         try {
@@ -3702,42 +3490,14 @@ public class NamaModule extends UniModule {
 
     /** deviceLost 之后 AI 与全部 beauty item 均失效 */
     private static void markNamaResourcesLost(String reason) {
-        try {
-            MediaGlContext.releaseAll();
-        } catch (Throwable ignored) {
-        }
-        beautyItemHandle = 0;
-        mediaBeautyItemHandle = 0;
-        FuBeautyHandle.clearAll();
-        aiModelLoaded = false;
+        NamaSdkManager.markResourcesLost(reason);
         // 资源已 lost，后续静图可再走相机 GL / 新 offscreen，勿继续强制 avoid
         sAvoidCameraGlForImageAfterVideo = false;
-        Log.e(TAG, "markNamaResourcesLost reason=" + reason);
     }
 
     /** 仅当静图 offscreen EGL 确实存在时释放并清 handle */
     private static void releaseMediaGlIfNeeded(String reason) {
-        boolean lost;
-        try {
-            lost = MediaGlContext.releaseAll();
-        } catch (Throwable t) {
-            lost = false;
-        }
-        if (lost) {
-            beautyItemHandle = 0;
-            mediaBeautyItemHandle = 0;
-            FuBeautyHandle.clearAll();
-            aiModelLoaded = false;
-            Log.e(TAG, "releaseMediaGlIfNeeded reason=" + reason);
-        }
-    }
-
-    private static boolean isSpecialAlgoBeautyKey(String key) {
-        return "body_blur_level".equals(key)
-                || "delspot_level".equals(key)
-                || "facial_plump".equals(key)
-                || "intensity_eye_pupil".equals(key)
-                || "enable_skinseg".equals(key);
+        NamaSdkManager.releaseMediaGlIfNeeded(reason);
     }
 
     private void resetOverlayLayoutCache() {
@@ -3745,6 +3505,22 @@ public class NamaModule extends UniModule {
         lastCssY = -1;
         lastCssW = -1;
         lastCssH = -1;
+        resetParkedBoxCache();
+    }
+
+    private void watchHostRecreate() {
+        try {
+            Activity host = resolveHostActivity();
+            if (host != null) {
+                NamaHostRecreateWatch.install(host);
+                return;
+            }
+            Activity overlay = resolveStaticActivity();
+            if (overlay != null) {
+                NamaHostRecreateWatch.install(overlay);
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     private Activity resolveHostActivity() {
@@ -3783,51 +3559,18 @@ public class NamaModule extends UniModule {
     }
 
     private void ensureInitialized() {
-        if (!initialized) {
-            throw new IllegalStateException("请先 init");
-        }
-        if (faceunity.fuIsLibraryInit() == 0) {
-            throw new IllegalStateException("SDK 未就绪 fuIsLibraryInit=0，请重新 init");
-        }
-    }
-
-    private byte[] readFileBytes(String path) throws IOException {
-        if (path == null || path.isEmpty()) {
-            throw new IOException("path 不能为空");
-        }
-        String realPath = path.startsWith("file://") ? path.substring(7) : path;
-        File file = new File(realPath);
-        if (!file.exists()) {
-            throw new IOException("文件不存在: " + realPath);
-        }
-        FileInputStream in = new FileInputStream(file);
-        byte[] data = new byte[(int) file.length()];
-        int read = in.read(data);
-        in.close();
-        if (read <= 0) {
-            throw new IOException("读取失败: " + realPath);
-        }
-        return data;
+        NamaSdkManager.ensureInitialized();
     }
 
     private JSONObject success(Object data) {
-        JSONObject ret = new JSONObject();
-        ret.put("code", 0);
-        ret.put("data", data);
-        return ret;
+        return NamaJsResult.success(data);
     }
 
     private JSONObject fail(String message) {
-        return fail(message, null);
+        return NamaJsResult.fail(message);
     }
 
     private JSONObject fail(String message, JSONObject diag) {
-        JSONObject ret = new JSONObject();
-        ret.put("code", -1);
-        ret.put("message", message != null ? message : "unknown error");
-        if (diag != null) {
-            ret.put("data", diag);
-        }
-        return ret;
+        return NamaJsResult.fail(message, diag);
     }
 }

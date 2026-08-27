@@ -26,9 +26,10 @@ if (-not (Test-Path $coreClassesJar)) { throw "缺少 core-classes.jar" }
 if (-not (Test-Path $kotlinJar)) { throw "缺少 kotlin-stdlib jar" }
 if (-not (Test-Path $coreAar)) { throw "缺少 core-9.0.1.aar" }
 if (-not (Test-Path $namaSrcDir)) { throw "缺少 nama 源码目录" }
+if (-not (Test-Path $authSrcDir)) { throw "缺少 authpack 源码目录" }
 $authpackJava = Join-Path $authSrcDir 'authpack.java'
 if (-not (Test-Path $authpackJava)) {
-    throw "缺少 authpack.java（证书方提供，本地放入 $authpackJava，勿提交 git）"
+    throw "缺少 authpack.java，请将证书方提供的文件放到: $authpackJava"
 }
 
 # 编译期 nama.jar：优先插件 libs，否则从 core AAR 解出
@@ -48,7 +49,7 @@ Remove-Item -Recurse -Force $classes, $buildOut -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $classes, $buildOut, $pluginLibs | Out-Null
 
 $stubSources = Get-ChildItem (Join-Path $buildDir 'stubs') -Recurse -Filter '*.java' | ForEach-Object { $_.FullName }
-$namaSources = Get-ChildItem $namaSrcDir -Filter '*.java' | ForEach-Object { $_.FullName }
+$namaSources = Get-ChildItem $namaSrcDir -Recurse -Filter '*.java' | ForEach-Object { $_.FullName }
 $authSources = Get-ChildItem $authSrcDir -Filter '*.java' | ForEach-Object { $_.FullName }
 $sources = $namaSources + $authSources + $stubSources
 $cp = "$androidJar;$fastjsonJar;$coreClassesJar;$kotlinJar;$namaCompileJar"
@@ -73,7 +74,11 @@ if (Test-Path $chromeAssets) {
 }
 
 $manifest = Join-Path $buildOut 'AndroidManifest.xml'
-Set-Content -Path $manifest -Value '<?xml version="1.0" encoding="utf-8"?><manifest package="com.faceunity.nama" />' -Encoding UTF8
+@'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.faceunity.nama" />
+'@ | Set-Content -Path $manifest -Encoding UTF8
 
 $aarPath = Join-Path $pluginAndroid 'FaceUnity-Nama.aar'
 if (Test-Path $aarPath) { Remove-Item $aarPath -Force }

@@ -1,7 +1,7 @@
 <template>
   <view class="page">
     <view class="header" :style="headerStyle">
-      <view class="header__title">FU Live Demo 特效版</view>
+      <view class="header__title">FULiveUniDemo</view>
     </view>
 
     <view class="body" :class="{ 'body--compact': isCompactScreen }" :style="scrollStyle">
@@ -49,7 +49,13 @@ import {
   applyStatusBarStyle,
   hideNativeTitleNView,
 } from '@/utils/app-plus-style'
-import { ensureMediaPermissions, preloadNamaSdk } from '@/utils/nama-app'
+import {
+  ensureAndroidNamaSessionFresh,
+  ensureMediaPermissions,
+  isNamaReady,
+  preloadNamaSdk,
+  requestNativePermissions,
+} from '@/utils/nama-app'
 
 const HEADER_CONTENT_PX = 44
 const safeAreaTop = ref(0)
@@ -85,6 +91,8 @@ onLoad(() => {
 
   // #ifdef APP-PLUS
   // 相机/麦克风/存储一并在首页申请，避免美颜页拍摄时弹系统权限导致黑屏、相册写入异常
+  // iOS 优先走原生 requestPermissions（plus.ios 桥接对麦克风偶现不弹框）
+  requestNativePermissions().catch(() => undefined)
   ensureMediaPermissions().catch(() => {
     // 已授权时不弹 toast；真正缺权限会在美颜页再次提示
   })
@@ -99,11 +107,31 @@ onShow(() => {
   syncLayoutMetrics()
   hideNativeTitleNView()
   applyStatusBarStyle()
+  // #ifdef APP-PLUS
+  // 系统导航切换后若进程还在、Activity 已死：整进程冷启动，不修半死 overlay
+  ensureAndroidNamaSessionFresh()
+    .then(() => {
+      if (!isNamaReady()) {
+        return preloadNamaSdk()
+      }
+    })
+    .catch(() => undefined)
+  // #endif
 })
 
-function goBeauty() {
+let navigatingBeauty = false
+async function goBeauty() {
   // #ifdef APP-PLUS
-  uni.navigateTo({ url: '/pages/beauty/beauty' })
+  if (navigatingBeauty) {
+    return
+  }
+  navigatingBeauty = true
+  try {
+    await ensureAndroidNamaSessionFresh()
+    uni.navigateTo({ url: '/pages/beauty/beauty' })
+  } finally {
+    navigatingBeauty = false
+  }
   // #endif
   // #ifndef APP-PLUS
   uni.showToast({ title: '请运行到 App 自定义基座', icon: 'none' })

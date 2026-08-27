@@ -1,5 +1,5 @@
 {
-  "name": "uni-preset-vue",
+  "name": "fulive-uni-demo",
   "version": "0.0.0",
   "scripts": {
     "dev:custom": "uni -p",

@@ -1,11 +1,13 @@
 #import "NamaModule.h"
-#import "CNamaSDK.h"
+#import "core/CNamaSDK.h"
 #import "DCUniDefine.h"
-#import "authpack.h"
-#import "BeautyCameraView.h"
-#import "BeautyVideoView.h"
-#import "PreviewChromeView.h"
-#import "FuBeautyPanelView.h"
+#import "auth/authpack.h"
+#import "core/BeautyCameraView.h"
+#import "core/BeautyVideoView.h"
+#import "ui/PreviewChromeView.h"
+#import "ui/FuBeautyPanelView.h"
+#import <sys/sysctl.h>
+#import <TargetConditionals.h>
 
 // 运行时取类，避免 slim 漏链 PreviewChromeView.o 时留下未定义 _OBJC_CLASS_$_ 导致基座加载即闪退
 static Class FuPreviewChromeViewClass(void) {
@@ -24,11 +26,10 @@ static Class FuBeautyPanelViewClass(void) {
     });
     return cls;
 }
-#import "VideoBeautyExporter.h"
+#import "core/VideoBeautyExporter.h"
 
 #import <string.h>
-#import <sys/sysctl.h>
-#import "FuBeautyHandle.h"
+#import "core/FuBeautyHandle.h"
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <OpenGLES/EAGL.h>
@@ -103,24 +104,187 @@ static int FuItemSetParamsLogged(int handle, const char *name, const char *value
     return fuItemSetParams(handle, name, value);
 }
 
-int FuDevicePerformanceLevelCached(void) {
-    static int sLevel = -1;
-    if (sLevel > 0) {
-        return sLevel;
+static int sResolvedSdkDeviceLevel = 0;
+static int sHardwareDeviceLevel = 0;
+
+static NSString *FuHardwareMachineId(void) {
+    size_t size = 0;
+    if (sysctlbyname("hw.machine", NULL, &size, NULL, 0) != 0 || size == 0) {
+        return @"";
     }
-    int level = 0;
-    if (fuIsLibraryInit()) {
-        @try {
-            int sdk = fuGetDeviceLevel();
-            // SDK：1~4 有效；-99 表示无推荐
-            if (sdk >= 1 && sdk <= 4) {
-                level = sdk;
-            }
-        } @catch (__unused NSException *e) {
+    char *machine = (char *)malloc(size);
+    if (!machine) {
+        return @"";
+    }
+    if (sysctlbyname("hw.machine", machine, &size, NULL, 0) != 0) {
+        free(machine);
+        return @"";
+    }
+    NSString *result = [NSString stringWithUTF8String:machine] ?: @"";
+    free(machine);
+    return result;
+}
+
+/** 对齐 Android MediaFuSetup RAM 分档（未知机型兜底） */
+static int FuDevicePerformanceLevelFromRamGb(double memGb) {
+    if (memGb <= 0) {
+        return 1;
+    }
+    if (memGb < 2.0) {
+        return 1;
+    }
+    if (memGb < 4.0) {
+        return 1;
+    }
+    if (memGb < 7.0) {
+        return 2;
+    }
+    if (memGb < 11.5) {
+        return 3;
+    }
+    return 4;
+}
+
+/**
+ * iOS 机型分级（不用 fuGetDeviceLevel）：
+ * iPhone 8 / X 档 → 2；iPhone 11 档 → 3；iPhone 12+ → 4；更老 → 1
+ * 内部型号：iPhone12,x=11；iPhone13,x=12 全系；iPhone14,x 起为 13/14…
+ */
+static int FuDevicePerformanceLevelFromHardware(void) {
+#if TARGET_OS_SIMULATOR
+    return 4;
+#endif
+    NSString *machine = FuHardwareMachineId();
+    if (machine.length == 0) {
+        double ramGb = NSProcessInfo.processInfo.physicalMemory / (1024.0 * 1024.0 * 1024.0);
+        return FuDevicePerformanceLevelFromRamGb(ramGb);
+    }
+    if ([machine hasPrefix:@"iPhone"]) {
+        NSString *suffix = [machine substringFromIndex:6];
+        int major = 0;
+        sscanf([suffix UTF8String], "%d", &major);
+        if (major >= 13) {
+            return 4; // iPhone 12 及更新机型（含 12/12 mini/12 Pro/12 Pro Max）
+        }
+        if (major >= 12) {
+            return 3; // iPhone 11 全系
+        }
+        if (major >= 10) {
+            return 2; // iPhone 8 / X / XS / XR
+        }
+        return 1;
+    }
+    if ([machine hasPrefix:@"iPad"]) {
+        NSString *suffix = [machine substringFromIndex:4];
+        int major = 0;
+        sscanf([suffix UTF8String], "%d", &major);
+        if (major >= 13) {
+            return 4;
+        }
+        if (major >= 8) {
+            return 3;
+        }
+        return 2;
+    }
+    double ramGb = NSProcessInfo.processInfo.physicalMemory / (1024.0 * 1024.0 * 1024.0);
+    return FuDevicePerformanceLevelFromRamGb(ramGb);
+}
+
+static int FuResolveDevicePerformanceLevel(void) {
+    if (sHardwareDeviceLevel >= 1 && sHardwareDeviceLevel <= 4) {
+        return sHardwareDeviceLevel;
+    }
+    int level = FuDevicePerformanceLevelFromHardware();
+    if (level < 1 || level > 4) {
+        level = 1;
+    }
+    sHardwareDeviceLevel = level;
+    sResolvedSdkDeviceLevel = level;
+    FU_LOG("devicePerformanceLevel=%d machine=%@ ramGb=%.2f",
+           level,
+           FuHardwareMachineId(),
+           NSProcessInfo.processInfo.physicalMemory / (1024.0 * 1024.0 * 1024.0));
+    return level;
+}
+
+int FuDevicePerformanceLevelCached(void) {
+    return FuResolveDevicePerformanceLevel();
+}
+
+int FuClampedDevicePerformanceLevel(void) {
+    return FuResolveDevicePerformanceLevel();
+}
+
+void FuRefreshDevicePerformanceLevelFromSdk(void) {
+    sHardwareDeviceLevel = 0;
+    FuResolveDevicePerformanceLevel();
+}
+
+int FuBeautyPerfGateRequiredLevel(const char *key) {
+    if (!key || !key[0]) {
+        return -1;
+    }
+    typedef struct {
+        const char *k;
+        int level;
+    } FuPerfGateEntry;
+    static const FuPerfGateEntry kTable[] = {
+        {"blur_level", -1},
+        {"body_blur_level", 4},
+        {"delspot_level", 3},
+        {"facial_plump", 3},
+        {"color_level", 1},
+        {"color_level_mode2", 1},
+        {"red_level", 1},
+        {"clarity", 1},
+        {"sharpen", 1},
+        {"face_threed", 1},
+        {"eye_bright", 1},
+        {"tooth_whiten", 1},
+        {"remove_pouch_strength", 1},
+        {"remove_pouch_strength_mode2", 1},
+        {"remove_nasolabial_folds_strength", 1},
+        {"remove_nasolabial_folds_strength_mode2", 1},
+        {"enable_skinseg", 4},
+        {"cheek_thinning", -1},
+        {"cheek_v", 1},
+        {"cheek_narrow", 1},
+        {"cheek_narrow_mode2", 1},
+        {"cheek_short", 1},
+        {"cheek_small", 1},
+        {"cheek_small_mode2", 1},
+        {"intensity_cheekbones", 1},
+        {"intensity_lower_jaw", 1},
+        {"eye_enlarging", -1},
+        {"eye_enlarging_mode3", -1},
+        {"intensity_eye_circle", 1},
+        {"intensity_eye_pupil", -1},
+        {"intensity_chin", 1},
+        {"intensity_forehead", 1},
+        {"intensity_forehead_mode2", 1},
+        {"intensity_nose", -1},
+        {"intensity_nose_mode2", -1},
+        {"intensity_mouth", 1},
+        {"intensity_mouth_mode3", 1},
+        {"intensity_lip_thick", 2},
+        {"intensity_eye_height", 2},
+        {"intensity_canthus", 1},
+        {"intensity_eye_lid", 2},
+        {"intensity_eye_space", 1},
+        {"intensity_eye_rotate", 1},
+        {"intensity_long_nose", 1},
+        {"intensity_philtrum", 1},
+        {"intensity_smile", 1},
+        {"intensity_brow_height", 2},
+        {"intensity_brow_space", 2},
+        {"intensity_brow_thick", 2},
+    };
+    for (size_t i = 0; i < sizeof(kTable) / sizeof(kTable[0]); i++) {
+        if (strcmp(key, kTable[i].k) == 0) {
+            return kTable[i].level;
         }
     }
-    sLevel = MAX(1, MIN(4, level > 0 ? level : 1));
-    return sLevel;
+    return -1;
 }
 
 void FuBeautySetPipelineHandle(BOOL media, int handle) {
@@ -188,6 +352,9 @@ void FuUpdateBeautyBlurEffect(int beautyHandle) {
         return;
     }
     int level = FuDevicePerformanceLevelCached();
+    if (level < 1 || level > 4) {
+        level = 1;
+    }
     int wantType;
     int wantMask;
     if (level >= 3) {
@@ -230,7 +397,8 @@ BOOL FuBeautyChangeFramesHoldZero(void) {
 }
 
 double FuBeautyChangeFramesValue(void) {
-    return sBeautyChangeFramesHoldZero ? 0.0 : 12.0;
+    (void)sBeautyChangeFramesHoldZero;
+    return 0.0;
 }
 
 void FuEnsureAdvancedBeautySwitches(int beautyHandle) {
@@ -238,7 +406,6 @@ void FuEnsureAdvancedBeautySwitches(int beautyHandle) {
         return;
     }
     FuItemSetParamdLogged(beautyHandle, "disable_delspot", 0.0);
-    FuItemSetParamdLogged(beautyHandle, "use_facial_plump", 1.0);
     FuItemSetParamdLogged(beautyHandle, "heavy_blur", 0.0);
     FuItemSetParamdLogged(beautyHandle, "skin_detect", 0.0);
     FuItemSetParamdLogged(beautyHandle, "face_shape", 4.0);
@@ -294,6 +461,14 @@ static double FuEffectiveSpecialValue(int beautyHandle, const char *key) {
     return fuItemGetParamd(beautyHandle, key);
 }
 
+BOOL FuIsDelspotOrPlumpActive(int beautyHandle) {
+    if (beautyHandle <= 0) {
+        return NO;
+    }
+    return FuEffectiveSpecialValue(beautyHandle, "delspot_level") > 0.001
+        || FuEffectiveSpecialValue(beautyHandle, "facial_plump") > 0.001;
+}
+
 BOOL FuIsSpecialBeautyParamName(const char *key) {
     if (!key) {
         return NO;
@@ -318,10 +493,10 @@ void FuApplyBeautyParamDirectOnGl(int beautyHandle, const char *key, double valu
     if (strcmp(key, "eye_bright") == 0) {
         fuItemSetParamd(beautyHandle, "eye_bright_v2", value);
     }
+    // 对齐 Android applySpecialAlgoParam：写强度 → disable_delspot → 回写强度
     if (strcmp(key, "facial_plump") == 0 || strcmp(key, "delspot_level") == 0) {
         fuItemSetParamd(beautyHandle, "disable_delspot", 0.0);
         if (strcmp(key, "facial_plump") == 0) {
-            fuItemSetParamd(beautyHandle, "use_facial_plump", 1.0);
             fuItemSetParamd(beautyHandle, "facial_plump", value);
         } else {
             fuItemSetParamd(beautyHandle, "delspot_level", value);
@@ -345,15 +520,14 @@ void FuApplySpecialBeautyParamOnGl(int beautyHandle, const char *key, double val
     FuApplyBeautyParamDirectOnGl(beautyHandle, key, value);
 }
 
-/** 滑杆拖动时 ValueChanged 可能节流，SDK 也可能帧间清 use_facial_plump；每帧用 cache+get 重 latch */
+/** 滑杆拖动时 ValueChanged 可能节流，SDK 也可能帧间清 facial_plump 等；每帧用 cache+get 重 latch */
 void FuReconfirmSpecialBeautySwitches(int beautyHandle) {
     if (beautyHandle <= 0) {
         return;
     }
     double plump = FuEffectiveSpecialValue(beautyHandle, "facial_plump");
-    // 始终开启丰盈开关，仅强度为 0 时无视觉效果（对齐高端机可常开 use_facial_plump）
+    // 对齐 Android reconfirmBeforeRender：只写 disable_delspot + 强度
     fuItemSetParamd(beautyHandle, "disable_delspot", 0.0);
-    fuItemSetParamd(beautyHandle, "use_facial_plump", 1.0);
     fuItemSetParamd(beautyHandle, "facial_plump", plump);
     double delspot = FuEffectiveSpecialValue(beautyHandle, "delspot_level");
     if (delspot > 0.001) {
@@ -396,7 +570,6 @@ void FuTryApplyAdvancedBeautySetUseAfterRender(int beautyHandle) {
         int h = beautyHandle > 0 ? beautyHandle : FuBeautyCameraHandle;
         if (h > 0) {
             FuItemSetParamdLogged(h, "disable_delspot", 0.0);
-            FuItemSetParamdLogged(h, "use_facial_plump", 1.0);
         }
         sAdvancedBeautySetUseApplied = YES;
     }
@@ -562,46 +735,63 @@ static void FuEnableFaceAlgorithmModules(void) {
 //  让NamaModule 能收 UIImagePicker 回调（对齐FULiveDemo 系统相册白底+取消）
 - (void)imagePickerController:(UIImagePickerController *)picker
 didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
-    [picker dismissViewControllerAnimated:YES completion:nil];
     UniModuleKeepAliveCallback cb = _pickMediaCallback;
     _pickMediaCallback = nil;
-    if (!cb) {
-        return;
-    }
-    NSString *mediaType = info[UIImagePickerControllerMediaType];
-    if ([mediaType isEqualToString:(NSString *)kUTTypeImage]) {
-        UIImage *image = info[UIImagePickerControllerOriginalImage];
-        if (![image isKindOfClass:[UIImage class]]) {
-            cb(@{ @"code": @(-1), @"message": @"未选择图片" }, NO);
+    NSDictionary *infoCopy = [info copy];
+    // 先关相册再后台落盘：主线程同步 JPEG/拷视频会卡死选完后的跳转
+    [picker dismissViewControllerAnimated:YES completion:^{
+        if (!cb) {
             return;
         }
-        NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                          [NSString stringWithFormat:@"nama_pick_%@.jpg", @((long long)(NSDate.date.timeIntervalSince1970 * 1000))]];
-        NSData *data = UIImageJPEGRepresentation(image, 0.95);
-        if (!data || ![data writeToFile:path atomically:YES]) {
-            cb(@{ @"code": @(-1), @"message": @"保存图片失败" }, NO);
-            return;
-        }
-        cb(@{ @"code": @(0), @"data": @{ @"path": path, @"type": @"image" } }, NO);
-        return;
-    }
-    // 视频：优先MediaURL，再兜底拷贝
-    NSURL *mediaURL = info[UIImagePickerControllerMediaURL];
-    if ([mediaURL isKindOfClass:[NSURL class]] && mediaURL.isFileURL) {
-        NSString *ext = mediaURL.pathExtension.length > 0 ? mediaURL.pathExtension : @"mp4";
-        NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                          [NSString stringWithFormat:@"nama_pick_%@.%@", @((long long)(NSDate.date.timeIntervalSince1970 * 1000)), ext]];
-        NSError *err = nil;
-        [[NSFileManager defaultManager] removeItemAtPath:dest error:nil];
-        if ([[NSFileManager defaultManager] copyItemAtURL:mediaURL toURL:[NSURL fileURLWithPath:dest] error:&err]) {
-            cb(@{ @"code": @(0), @"data": @{ @"path": dest, @"type": @"video" } }, NO);
-            return;
-        }
-        //  拷贝失败则直接用原路径
-        cb(@{ @"code": @(0), @"data": @{ @"path": mediaURL.path ?: @"", @"type": @"video" } }, NO);
-        return;
-    }
-    cb(@{ @"code": @(-1), @"message": @"未选择视频" }, NO);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSString *mediaType = infoCopy[UIImagePickerControllerMediaType];
+            if ([mediaType isEqualToString:(NSString *)kUTTypeImage]) {
+                UIImage *image = infoCopy[UIImagePickerControllerOriginalImage];
+                if (![image isKindOfClass:[UIImage class]]) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        cb(@{ @"code": @(-1), @"message": @"未选择图片" }, NO);
+                    });
+                    return;
+                }
+                NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                                  [NSString stringWithFormat:@"nama_pick_%@.jpg", @((long long)(NSDate.date.timeIntervalSince1970 * 1000))]];
+                NSData *data = UIImageJPEGRepresentation(image, 0.92);
+                BOOL ok = data != nil && [data writeToFile:path atomically:YES];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (!ok) {
+                        cb(@{ @"code": @(-1), @"message": @"保存图片失败" }, NO);
+                        return;
+                    }
+                    cb(@{ @"code": @(0), @"data": @{ @"path": path, @"type": @"image" } }, NO);
+                });
+                return;
+            }
+            // 视频仍拷到 App 临时目录，避免相册临时 URL 被系统回收
+            NSURL *mediaURL = infoCopy[UIImagePickerControllerMediaURL];
+            if ([mediaURL isKindOfClass:[NSURL class]] && mediaURL.isFileURL) {
+                NSString *ext = mediaURL.pathExtension.length > 0 ? mediaURL.pathExtension : @"mp4";
+                NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                                  [NSString stringWithFormat:@"nama_pick_%@.%@", @((long long)(NSDate.date.timeIntervalSince1970 * 1000)), ext]];
+                NSError *err = nil;
+                [[NSFileManager defaultManager] removeItemAtPath:dest error:nil];
+                BOOL copied = [[NSFileManager defaultManager] copyItemAtURL:mediaURL
+                                                                      toURL:[NSURL fileURLWithPath:dest]
+                                                                      error:&err];
+                NSString *outPath = copied ? dest : (mediaURL.path ?: @"");
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (outPath.length == 0) {
+                        cb(@{ @"code": @(-1), @"message": err.localizedDescription ?: @"未选择视频" }, NO);
+                        return;
+                    }
+                    cb(@{ @"code": @(0), @"data": @{ @"path": outPath, @"type": @"video" } }, NO);
+                });
+                return;
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                cb(@{ @"code": @(-1), @"message": @"未选择视频" }, NO);
+            });
+        });
+    }];
 }
 
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
@@ -838,9 +1028,16 @@ UNI_EXPORT_METHOD(@selector(showPreviewChrome:callback:))
                 callback(@{ @"code": @(-1), @"message": @"PreviewChromeView missing" }, NO);
                 return;
             }
-            sPreviewChromeView = [[chromeCls alloc] initWithFrame:CGRectZero];
+            // 直接用目标 frame 创建，避免 CGRectZero 首帧把拍摄钮画在左上角再跳位
+            CGRect box = [self previewBoxFrameOnDecor:x y:y width:width height:height];
+            sPreviewChromeView = [[chromeCls alloc] initWithFrame:box];
             sPreviewChromeView.delegate = (id<PreviewChromeViewDelegate>)self;
             [parent addSubview:sPreviewChromeView];
+            [UIView performWithoutAnimation:^{
+                [sPreviewChromeView setBottomChromeInset:sLastBeautyPanelHeight animated:NO];
+                [sPreviewChromeView setCompareButtonHidden:sLastBeautyPanelHeight > 0.5];
+                [sPreviewChromeView layoutIfNeeded];
+            }];
         } else if (sPreviewChromeView.superview != parent) {
             [sPreviewChromeView removeFromSuperview];
             [parent addSubview:sPreviewChromeView];
@@ -914,9 +1111,9 @@ UNI_EXPORT_METHOD(@selector(hidePreviewChrome:))
 }
 
 - (void)applyBeautyPanelBottomInset:(CGFloat)panelHeight {
-    BOOL animated = sChromeInsetDidInitial;
+    // 拍摄钮位置始终瞬切，避免进入美颜页时从错误位置滑入
     sChromeInsetDidInitial = YES;
-    [self applyBeautyPanelBottomInset:panelHeight animated:animated];
+    [self applyBeautyPanelBottomInset:panelHeight animated:NO];
 }
 
 - (UIView *)resolveBeautyPanelParentForMode:(NSString *)mode {
@@ -1057,9 +1254,8 @@ UNI_EXPORT_METHOD(@selector(showBeautyPanel:callback:))
         }
         sBeautyPanelView.hidden = NO;
         NSMutableDictionary *cfgMut = [NSMutableDictionary dictionaryWithDictionary:cfg];
-        if (cfgMut[@"devicePerfLevel"] == nil) {
-            cfgMut[@"devicePerfLevel"] = @(FuDevicePerformanceLevelCached());
-        }
+        // 始终以 SDK fuGetDeviceLevel 为准，避免 JS 默认 1 或过早查询导致高档机灰显
+        cfgMut[@"devicePerfLevel"] = @(FuClampedDevicePerformanceLevel());
         [sBeautyPanelView applyConfig:cfgMut];
         [self syncBeautyPanelLayout];
         BOOL media = [mode isEqualToString:@"image"] || [mode isEqualToString:@"video"];
@@ -1085,7 +1281,7 @@ UNI_EXPORT_METHOD(@selector(hideBeautyPanel:))
             sBeautyPanelView = nil;
         }
         if (sPreviewChromeView) {
-            [sPreviewChromeView setBottomChromeInset:0 animated:YES];
+            [sPreviewChromeView setBottomChromeInset:0 animated:NO];
             [sPreviewChromeView setCompareButtonHidden:NO];
         }
         sLastBeautyPanelHeight = 0;
@@ -1197,7 +1393,8 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
 }
 
 - (void)beautyPanelDidChangeHeight:(CGFloat)heightPts {
-    [self applyBeautyPanelBottomInset:heightPts animated:YES];
+    // 进入/切 Tab 时勿动画抬升拍摄钮，否则会从底部或左上角滑到目标位
+    [self applyBeautyPanelBottomInset:heightPts animated:NO];
     [self fireBeautyPanelEvent:@"panelHeight" extra:@{ @"height": @(heightPts) }];
 }
 - (void)beautyPanelSelectTab:(NSString *)tabId expanded:(BOOL)expanded {
@@ -1216,17 +1413,8 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
             [sdkKey isEqualToString:@"intensity_eye_pupil"] ||
             [sdkKey isEqualToString:@"enable_skinseg"];
         if (special) {
-            // 对齐 Android applySpecialAlgoParam：单 key 入队，flush 时走 special 写参
+            // 只入队 + cache，由渲染线程 flush/reconfirm 写参（主线程抢 GL 会偶现写不上）
             [BeautyCameraView enqueueBeautyParam:handle name:sdkKey value:value];
-            // 面部丰盈等特殊算法：滑杆拖动时立即 GL 落地，避免仅靠队列+帧间 latch 间歇失效
-            if ([sdkKey isEqualToString:@"facial_plump"] ||
-                [sdkKey isEqualToString:@"delspot_level"] ||
-                [sdkKey isEqualToString:@"intensity_eye_pupil"]) {
-                const char *cKey = sdkKey.UTF8String;
-                [BeautyCameraView performWithSharedGLLock:^{
-                    FuApplyBeautyParamDirectOnGl(handle, cKey, value);
-                }];
-            }
             if ([sdkKey isEqualToString:@"body_blur_level"]) {
                 FuResetBeautyBlurCache();
             }
@@ -1285,16 +1473,6 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
 
     [self refreshPausedVideoBeautyIfNeeded];
     [self requestCameraPreviewRedrawIfActive];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (FuBeautyChangeFramesHoldZero()) {
-            return;
-        }
-        int h = [self resolvePanelBeautyHandle];
-        if (h > 0) {
-            [BeautyCameraView enqueueBeautyParam:h name:@"change_frames" value:12.0];
-        }
-    });
 }
 
 - (void)beautyPanelDidRecoverDefaults:(NSString *)tabId {
@@ -1491,9 +1669,14 @@ UNI_EXPORT_METHOD(@selector(loadAIModel:callback:))
         }
         // load 后再开公开侧开关（ARMesh / algorithm config）；勿调未公开 FUAI_SetUse*
         FuEnableAdvancedBeautyRuntime(0);
-        int perf = FuDevicePerformanceLevelCached();
-        // 多人跟踪是 SDK 算力瓶颈（非 Vue 写法问题）；低端限制 2 脸减轻 UI 卡顿
-        fuSetMaxFaces(perf >= 4 ? 4 : 2);
+        FuRefreshDevicePerformanceLevelFromSdk();
+        int perf = FuClampedDevicePerformanceLevel();
+        if (perf < 1 || perf > 4) {
+            perf = 1;
+        }
+        // 默认识别 4 人（对齐 Android NamaSdkManager.configureFaceProcessor）
+        fuSetMaxFaces(4);
+        (void)perf;
         fuSetFaceProcessorDetectMode(1);
         fuFaceProcessorSetMinFaceRatio(0.05f);
         int faceOk = fuIsAIModelLoaded(FUAITYPE_FACEPROCESSOR);
@@ -1513,6 +1696,7 @@ UNI_EXPORT_METHOD(@selector(loadAIModel:callback:))
                 @"moduleCode1": @(m1),
                 @"moduleCode2": @(m2),
                 @"moduleCode3": @(m3),
+                @"deviceLevel": @(perf),
             },
         }, NO);
     } @catch (NSException *exception) {
@@ -1554,7 +1738,6 @@ UNI_EXPORT_METHOD(@selector(loadBundle:callback:))
         FuItemSetParamdLogged(handle, "facial_plump", 0.0);
         FuItemSetParamdLogged(handle, "intensity_eye_pupil", 0.5);
         FuItemSetParamdLogged(handle, "disable_delspot", 0.0);
-        FuItemSetParamdLogged(handle, "use_facial_plump", 1.0);
         FuResetBeautyBlurCache();
         FuUpdateBeautyBlurEffect(handle);
         FU_LOG("loadBundle pipeline=%@ handle=%d camera=%d media=%d",
@@ -1616,6 +1799,7 @@ UNI_EXPORT_METHOD(@selector(setParam:callback:))
             @"ret": @(0),
         } mutableCopy];
         if (special) {
+            // 只入队 + cache，渲染线程 flush 后生效（对齐 Android queueEvent）
             [BeautyCameraView enqueueBeautyParam:handle name:sdkKey value:value];
             if ([sdkKey isEqualToString:@"body_blur_level"]) {
                 FuResetBeautyBlurCache();
@@ -1623,6 +1807,10 @@ UNI_EXPORT_METHOD(@selector(setParam:callback:))
             retBlock = 0;
         } else {
             retBlock = FuItemSetParamdLogged(handle, sdkKey.UTF8String, value);
+            if ([sdkKey isEqualToString:@"eye_bright"]) {
+                FuItemSetParamdLogged(handle, "eye_bright_v2", value);
+                FuCacheSpecialBeautyValue(handle, "eye_bright", value);
+            }
             (void)fuItemGetParamd(handle, sdkKey.UTF8String);
         }
         data[@"ret"] = @(retBlock);
@@ -2032,8 +2220,54 @@ UNI_EXPORT_METHOD(@selector(setOverlayWindowsHidden:callback:))
 
 UNI_EXPORT_METHOD(@selector(getDevicePerformanceLevel:))
 - (void)getDevicePerformanceLevel:(UniModuleKeepAliveCallback)callback {
-    int level = FuDevicePerformanceLevelCached();
+    int level = FuClampedDevicePerformanceLevel();
     callback(@{ @"code": @(0), @"data": @{ @"level": @(level) } }, NO);
+}
+
+UNI_EXPORT_METHOD(@selector(requestPermissions:))
+- (void)requestPermissions:(UniModuleKeepAliveCallback)callback {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __block BOOL cameraGranted = NO;
+        __block BOOL micGranted = NO;
+        __block int pending = 2;
+        dispatch_block_t finish = ^{
+            pending--;
+            if (pending > 0) {
+                return;
+            }
+            callback(@{
+                @"code": @(0),
+                @"data": @{
+                    @"camera": @(cameraGranted),
+                    @"microphone": @(micGranted),
+                }
+            }, NO);
+        };
+        AVAuthorizationStatus camSt = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
+        if (camSt == AVAuthorizationStatusAuthorized) {
+            cameraGranted = YES;
+            finish();
+        } else if (camSt == AVAuthorizationStatusNotDetermined) {
+            [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
+                cameraGranted = granted;
+                finish();
+            }];
+        } else {
+            finish();
+        }
+        AVAuthorizationStatus micSt = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+        if (micSt == AVAuthorizationStatusAuthorized) {
+            micGranted = YES;
+            finish();
+        } else if (micSt == AVAuthorizationStatusNotDetermined) {
+            [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
+                micGranted = granted;
+                finish();
+            }];
+        } else {
+            finish();
+        }
+    });
 }
 
 UNI_EXPORT_METHOD(@selector(getPreviewDiag:))
@@ -2579,6 +2813,7 @@ UNI_EXPORT_METHOD(@selector(processImage:callback:))
             [BeautyCameraView performWithSharedGLLock:^{
                 fuMakeGLContextCurrent();
                 [BeautyCameraView flushPendingBeautyParams];
+                fuMakeGLContextCurrent();
                 FuReconfirmSpecialBeautySwitches(handle);
                 fuSetDefaultRotationMode(FU_ROTATION_MODE_0);
                 fuSetInputCameraMatrix(0, 0, FU_ROTATION_MODE_0);
@@ -2811,32 +3046,6 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
     [previewBox addSubview:playBtn];
     sOverlayVideoPlayBtn = playBtn;
 
-    NSError *loadErr = nil;
-    if (![view loadVideoPath:path error:&loadErr]) {
-        [view removeFromSuperview];
-        [host removeFromSuperview];
-        sOverlayVideoPlayBtn = nil;
-        callback(@{ @"code": @(-1), @"message": loadErr.localizedDescription ?: @"加载视频失败" }, NO);
-        return;
-    }
-
-    __weak typeof(self) weakSelf = self;
-    view.onFirstFrame = ^{
-        if (sOverlayVideoPlayBtn) {
-            sOverlayVideoPlayBtn.hidden = NO;
-            [sOverlayVideoPlayBtn.superview bringSubviewToFront:sOverlayVideoPlayBtn];
-        }
-    };
-    view.onPlaybackEnded = ^{
-        if (sOverlayVideoPlayBtn) {
-            sOverlayVideoPlayBtn.hidden = NO;
-            [sOverlayVideoPlayBtn.superview bringSubviewToFront:sOverlayVideoPlayBtn];
-        }
-        [weakSelf fireVideoEvent:@"ended" extra:nil];
-    };
-    // 默认暂停 + 首帧；不循环播放
-    [view prepareFirstFrame];
-
     sOverlayVideoView = view;
     sOverlayVideoHost = host;
     sLastVideoPath = [path copy];
@@ -2859,8 +3068,9 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
         [self syncBeautyPanelLayout];
     }
 
-    FU_LOG("showVideoPreview css:%dx%d@%d,%d box=%@ path=%@ mediaHandle=%d",
+    FU_LOG("showVideoPreview hostReady css:%dx%d@%d,%d box=%@ path=%@ mediaHandle=%d",
            width, height, x, y, NSStringFromCGRect(boxFrame), path, FuBeautyMediaHandle);
+    // 先回传：黑底宿主已上屏，JS 可立刻挂面板；解码/首帧美颜下一拍再做，避免长时间黑屏干等
     callback(@{
         @"code": @(0),
         @"data": @{
@@ -2871,18 +3081,50 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
         }
     }, NO);
 
-    for (NSNumber *delay in @[ @0.3, @0.8, @1.5 ]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self bringVideoOverlayToFront];
-            if (sBeautyPanelView) {
-                [self syncBeautyPanelLayout];
-                UIView *parent = sBeautyPanelView.superview;
-                if (parent) {
-                    [self ensureMediaBackButtonOnParent:parent];
-                }
+    NSString *pathCopy = [path copy];
+    __weak typeof(self) weakSelf = self;
+    __weak BeautyVideoView *weakView = view;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        BeautyVideoView *v = weakView;
+        if (!self || !v || v != sOverlayVideoView) {
+            return;
+        }
+        NSError *loadErr = nil;
+        if (![v loadVideoPath:pathCopy error:&loadErr]) {
+            FU_LOG("showVideoPreview loadVideo failed: %@", loadErr.localizedDescription);
+            [self fireVideoEvent:@"error" extra:@{
+                @"message": loadErr.localizedDescription ?: @"加载视频失败"
+            }];
+            return;
+        }
+        v.onFirstFrame = ^{
+            if (sOverlayVideoPlayBtn) {
+                sOverlayVideoPlayBtn.hidden = NO;
+                [sOverlayVideoPlayBtn.superview bringSubviewToFront:sOverlayVideoPlayBtn];
             }
-        });
-    }
+        };
+        v.onPlaybackEnded = ^{
+            if (sOverlayVideoPlayBtn) {
+                sOverlayVideoPlayBtn.hidden = NO;
+                [sOverlayVideoPlayBtn.superview bringSubviewToFront:sOverlayVideoPlayBtn];
+            }
+            [weakSelf fireVideoEvent:@"ended" extra:nil];
+        };
+        [v prepareFirstFrame];
+        for (NSNumber *delay in @[ @0.3, @0.8, @1.5 ]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [weakSelf bringVideoOverlayToFront];
+                if (sBeautyPanelView) {
+                    [weakSelf syncBeautyPanelLayout];
+                    UIView *parent = sBeautyPanelView.superview;
+                    if (parent) {
+                        [weakSelf ensureMediaBackButtonOnParent:parent];
+                    }
+                }
+            });
+        }
+    });
 }
 
 UNI_EXPORT_METHOD(@selector(pauseVideoPreview:))
@@ -3043,7 +3285,7 @@ UNI_EXPORT_METHOD(@selector(processVideo:callback:))
     sOverlayVideoHost = nil;
     sOverlayVideoPlayBtn = nil;
     sLastVideoPath = nil;
-    [view stopAndRelease];
+    [view detachAndScheduleGLRelease];
     [view removeFromSuperview];
     [host removeFromSuperview];
     if (onComplete) {

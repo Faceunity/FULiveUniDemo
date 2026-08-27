@@ -10,17 +10,12 @@ PLUGIN_LIB="libFaceUnityNamaPlugin.a"
 MIN_IOS="11.0"
 ARCH="arm64"
 
-AUTHPACK_H="${AUTHPACK_H:-$PLUGIN_IOS/authpack.h}"
-if [[ ! -f "$AUTHPACK_H" ]]; then
-  AUTHPACK_H="$SRC_IOS/authpack.h"
-fi
+AUTHPACK_H="$SRC_IOS/auth/authpack.h"
 if [[ ! -f "$AUTHPACK_H" ]]; then
   echo "错误: 缺少 authpack.h"
+  echo "请将证书方提供的 authpack.h 放到:"
+  echo "  $AUTHPACK_H"
   exit 1
-fi
-cp -f "$AUTHPACK_H" "$SRC_IOS/authpack.h"
-if [[ "$AUTHPACK_H" != "$PLUGIN_IOS/authpack.h" ]]; then
-  cp -f "$AUTHPACK_H" "$PLUGIN_IOS/authpack.h"
 fi
 echo "已找到 authpack.h"
 
@@ -47,17 +42,20 @@ CFLAGS=(
   -Wno-unused-variable
   -Wno-deprecated-declarations
   -I"$SRC_IOS"
+  -I"$SRC_IOS/auth"
+  -I"$SRC_IOS/core"
+  -I"$SRC_IOS/ui"
   "${INC_FLAGS[@]}"
 )
 
 SOURCES=(
   "$SRC_IOS/NamaModule.m"
-  "$SRC_IOS/BeautyCameraView.m"
-  "$SRC_IOS/BeautyCameraComponent.m"
-  "$SRC_IOS/BeautyVideoView.m"
-  "$SRC_IOS/VideoBeautyExporter.m"
-  "$SRC_IOS/PreviewChromeView.m"
-  "$SRC_IOS/FuBeautyPanelView.m"
+  "$SRC_IOS/core/BeautyCameraView.m"
+  "$SRC_IOS/ui/BeautyCameraComponent.m"
+  "$SRC_IOS/core/BeautyVideoView.m"
+  "$SRC_IOS/core/VideoBeautyExporter.m"
+  "$SRC_IOS/ui/PreviewChromeView.m"
+  "$SRC_IOS/ui/FuBeautyPanelView.m"
 )
 
 # 仅用桩头编译时，补一份 DCUniComponent 空实现以便链接进 .o（真机基座用 SDK 真类）
