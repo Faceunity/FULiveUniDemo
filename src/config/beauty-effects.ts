@@ -297,6 +297,43 @@ export function getFilterPresetById(id: string) {
   return FILTER_PRESETS.find((f) => f.id === id) ?? FILTER_PRESETS[1]
 }
 
+/** 各滤镜独立强度槽位（对齐原生 filter_level:ziran1） */
+export function filterLevelStorageKey(filterId: string): string {
+  if (!filterId || filterId === 'origin') {
+    return 'filter_level'
+  }
+  return `filter_level:${filterId}`
+}
+
+/** 读取某滤镜 UI 滑杆值（0~100） */
+export function getFilterLevelSliderUi(values: Record<string, number>, filterId: string): number {
+  const key = filterLevelStorageKey(filterId)
+  if (values[key] != null) {
+    return values[key]
+  }
+  if (values.filter_level != null) {
+    return values.filter_level
+  }
+  return defaultSliderValue(FILTER_LEVEL_ITEM)
+}
+
+/** 写入某滤镜 UI 滑杆值 */
+export function setFilterLevelSliderUi(
+  values: Record<string, number>,
+  filterId: string,
+  ui: number,
+) {
+  values[filterLevelStorageKey(filterId)] = ui
+}
+
+/** 把全局 filter_level 迁移到指定滤镜槽位（仅槽位为空时） */
+export function migrateGlobalFilterLevel(values: Record<string, number>, filterId: string) {
+  const key = filterLevelStorageKey(filterId)
+  if (values[key] == null && values.filter_level != null) {
+    values[key] = values.filter_level
+  }
+}
+
 /** 全部滑杆项（初始化用） */
 export const ALL_SLIDER_EFFECTS: BeautyEffectItem[] = [
   ...BEAUTY_SKIN_EFFECTS,
@@ -400,24 +437,12 @@ export function getSliderZero(item: BeautyEffectItem): number {
 
 /**
  * UI 滑杆 → SDK 值。
- * 单向 0~100 → [min,max]；双向 -50~50 → [min,max]（0 对应中性，多为 0.5）
+ * 单向 0~100 → [min,max]；双向 -50~50 → [min,max]（线性，对齐 Android sdkValueFromSlider）
  */
 export function sliderToValue(slider: number, item: BeautyEffectItem): number {
   const sMin = getSliderMin(item)
   const sMax = getSliderMax(item)
   const clamped = Math.min(sMax, Math.max(sMin, slider))
-  if (item.sliderZero != null) {
-    const z = item.sliderZero
-    if (Math.abs(clamped - z) < 0.01) {
-      return item.default
-    }
-    if (clamped > z) {
-      const ratio = (clamped - z) / (sMax - z)
-      return Math.round((item.default + ratio * (item.max - item.default)) * 100) / 100
-    }
-    const ratio = (clamped - z) / (z - sMin)
-    return Math.round((item.default + ratio * (item.min - item.default)) * 100) / 100
-  }
   const ratio = sMax === sMin ? 0 : (clamped - sMin) / (sMax - sMin)
   const raw = item.min + ratio * (item.max - item.min)
   return Math.round(raw * 100) / 100
@@ -426,18 +451,6 @@ export function sliderToValue(slider: number, item: BeautyEffectItem): number {
 export function valueToSlider(value: number, item: BeautyEffectItem): number {
   const sMin = getSliderMin(item)
   const sMax = getSliderMax(item)
-  if (item.sliderZero != null) {
-    const z = item.sliderZero
-    if (Math.abs(value - item.default) < 0.01) {
-      return z
-    }
-    if (value > item.default) {
-      const ratio = (value - item.default) / (item.max - item.default)
-      return Math.round(z + ratio * (sMax - z))
-    }
-    const ratio = (value - item.default) / (item.min - item.default)
-    return Math.round(z + ratio * (z - sMin))
-  }
   if (item.max === item.min) return sMin
   const ratio = (value - item.min) / (item.max - item.min)
   return Math.round(sMin + Math.min(1, Math.max(0, ratio)) * (sMax - sMin))
@@ -447,11 +460,17 @@ export function defaultSliderValue(item: BeautyEffectItem): number {
   return valueToSlider(item.default, item)
 }
 
-/** 图标「已调参」：滑杆相对默认值有偏移（双向项默认常为 -50 等） */
+/** 图标「已调参」：与气泡显示一致，UI 显示 0 → 默认态 */
 export function isEffectChanged(item: BeautyEffectItem, slider: number): boolean {
-  const def = defaultSliderValue(item)
-  const cur = slider ?? def
-  return Math.abs(cur - def) > 0.01
+  const zeroRef = item.sliderZero != null
+    ? item.sliderZero
+    : isBidirectionalSlider(item)
+      ? defaultSliderValue(item)
+      : 0
+  const cur = slider ?? zeroRef
+  const bidir = isBidirectionalSlider(item) || item.sliderZero != null
+  const display = bidir ? Math.round(cur - zeroRef) : Math.round(cur)
+  return display !== 0
 }
 
 /** 归一化显示值 0~1（刻度尺顶部数值） */

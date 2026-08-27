@@ -1,18 +1,19 @@
 node_modules/
 dist/
 unpackage/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
 scripts/build-bridge/classes/
+scripts/build-bridge/classes2/
 scripts/build-bridge/out/
+scripts/build-bridge/sources*.txt
 scripts/build-bridge/deps/
 scripts/build-ios-framework/out/
 scripts/build-ios-framework/out-slim/
+scripts/build-bridge/tools/
 *.log
 .DS_Store
 Thumbs.db
 .env
 .env.*
-# 鉴权文件（本地放置，勿提交）
-scripts/build-bridge/src/com/faceunity/app/authpack.java
-scripts/build-ios-framework/src/ios/authpack.h
-nativeplugins/FaceUnity-Nama/ios/authpack.h
-src/static/authpack.*

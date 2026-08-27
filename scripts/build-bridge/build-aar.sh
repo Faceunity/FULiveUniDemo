@@ -49,6 +49,14 @@ if [[ ! -f "$NAMA_JAR" ]]; then
   exit 1
 fi
 
+AUTHPACK_JAVA="$BUILD_DIR/src/com/faceunity/app/authpack.java"
+if [[ ! -f "$AUTHPACK_JAVA" ]]; then
+  echo "错误: 缺少 authpack.java"
+  echo "请将证书方提供的 authpack.java 放到:"
+  echo "  $AUTHPACK_JAVA"
+  exit 1
+fi
+
 rm -rf "$CLASSES" "$OUT"
 mkdir -p "$CLASSES" "$OUT"
 
@@ -75,8 +83,11 @@ if [[ -d "$CHROME_ASSETS" ]]; then
   echo "已打包 fu_chrome 图标资源"
 fi
 
-printf '%s\n' '<?xml version="1.0" encoding="utf-8"?><manifest package="com.faceunity.nama" />' \
-  > "$OUT/AndroidManifest.xml"
+cat > "$OUT/AndroidManifest.xml" <<'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.faceunity.nama" />
+EOF
 
 AAR_PATH="$PLUGIN_ANDROID/FaceUnity-Nama.aar"
 rm -f "$AAR_PATH"

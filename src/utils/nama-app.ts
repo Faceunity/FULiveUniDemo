@@ -1,6 +1,14 @@
 /** FaceUnity Nama（APP-PLUS） */
 
 import {
+  androidNamaReinitReason,
+  androidNamaRelaunchReason,
+  shouldMarkAndroidNamaSessionDirty,
+  shouldReinitAndroidNamaSession,
+  type JsNamaSession,
+  type NamaSessionProbe,
+} from '@/utils/android-nama-session'
+import {
   BEAUTY_BASE_PARAMS,
   BEAUTY_SHAPE_EFFECTS,
   BEAUTY_SKIN_EFFECTS,
@@ -19,17 +27,11 @@ import {
 } from '@/config/beauty-effects'
 
 const PLUGIN_ID = 'FaceUnity-Nama'
-/** 随 App 打包的 Nama bundle（src/static/nama-bundle/） */
-const STATIC_BUNDLE_DIR = '/static/nama-bundle'
+const NAMA_BUNDLE_DIR = '/static/nama-bundle/'
+const AI_BUNDLE_FILE = 'ai_face_processor.bundle'
+const BEAUTY_BUNDLE_FILE = 'face_beautification.bundle'
 /** 完整 face AI（含皮肤分割/祛斑/ARMesh/丰盈）通常 >20MB */
 const AI_BUNDLE_MIN_BYTES = 18 * 1024 * 1024
-
-function namaBundleStaticPaths() {
-  return {
-    aiPath: `${STATIC_BUNDLE_DIR}/ai_face_processor.bundle`,
-    beautyPath: `${STATIC_BUNDLE_DIR}/face_beautification.bundle`,
-  }
-}
 
 type NamaResult<T = unknown> = { code: number; data?: T; message?: string }
 type NamaCallback = (res: NamaResult) => void
@@ -37,6 +39,8 @@ type NamaCallback = (res: NamaResult) => void
 type NamaPlugin = {
   getVersion: (cb: NamaCallback) => void
   isSdkAlive?: (cb: NamaCallback) => void
+  resetStaleOverlays?: (cb: NamaCallback) => void
+  relaunchProcess?: (cb: NamaCallback) => void
   init: (opts: Record<string, unknown>, cb: NamaCallback) => void
   loadAIModel: (opts: Record<string, unknown>, cb: NamaCallback) => void
   loadBundle: (opts: Record<string, unknown>, cb: NamaCallback) => void
@@ -56,6 +60,7 @@ type NamaPlugin = {
   setDualInput?: (opts: Record<string, unknown>, cb: NamaCallback) => void
   switchCamera?: (cb: NamaCallback) => void
   getDevicePerformanceLevel?: (cb: NamaCallback) => void
+  requestPermissions?: (cb: NamaCallback) => void
   tapFocus?: (opts: Record<string, unknown>, cb: NamaCallback) => void
   showPreviewChrome?: (opts: Record<string, unknown>, cb: NamaCallback) => void
   hidePreviewChrome?: (cb: NamaCallback) => void
@@ -79,6 +84,8 @@ type NamaPlugin = {
   processImage?: (opts: Record<string, unknown>, cb: NamaCallback) => void
   showVideoPreview?: (opts: Record<string, unknown>, cb: NamaCallback) => void
   pauseVideoPreview?: (cb: NamaCallback) => void
+  parkVideoForBackground?: (cb: NamaCallback) => void
+  resetVideoToIdle?: (cb: NamaCallback) => void
   resumeVideoPreview?: (cb: NamaCallback) => void
   destroyVideoPreview?: (opts: Record<string, unknown> | NamaCallback, cb?: NamaCallback) => void
   processVideo?: (opts: Record<string, unknown>, cb: NamaCallback) => void
@@ -108,6 +115,8 @@ let sdkInitPromise: Promise<void> | null = null
 let beautyInitPromise: Promise<number> | null = null
 /** 与 native MediaFuSetup 同步，供 JS 写参门禁 */
 let cachedDevicePerfLevel = 1
+/** 系统导航切换重建过 Activity：本 JS 生命周期内不得复用 parked overlay */
+let androidNamaSessionDirty = false
 
 function activeBeautyHandle() {
   return activePipeline === 'media' ? mediaBeautyHandle : cameraBeautyHandle
@@ -249,23 +258,10 @@ function runWithTimeout<T>(
   ])
 }
 
-function resolveStaticAssetUrl(relPath: string): string {
-  if (!relPath) return ''
-  if (relPath.startsWith('http://') || relPath.startsWith('https://') || relPath.startsWith('file://')) {
-    return relPath
-  }
-  // #ifdef APP-PLUS
-  try {
-    const local = `_www${relPath.startsWith('/') ? relPath : `/${relPath}`}`
-    const abs = plus.io.convertLocalFileSystemURL(local)
-    if (abs) {
-      return abs.startsWith('file://') ? abs : `file://${abs}`
-    }
-  } catch {
-    // ignore
-  }
-  // #endif
-  return relPath
+function pathExists(path: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    plus.io.resolveLocalFileSystemURL(path, () => resolve(true), () => resolve(false))
+  })
 }
 
 function getFileSize(path: string): Promise<number> {
@@ -283,21 +279,27 @@ function getFileSize(path: string): Promise<number> {
   })
 }
 
-/** 从 static 解析 bundle 绝对路径（随包分发，不走 OSS） */
-async function ensureStaticBundle(staticRelPath: string, minBytes = 0): Promise<string> {
-  const abs = resolveStaticAssetUrl(staticRelPath)
-  if (!abs || abs === staticRelPath) {
+/** 从 App 包内 static/nama-bundle 读取（随云打包，不走网络） */
+async function ensureStaticBundle(fileName: string, minBytes = 0): Promise<string> {
+  const path = resolveStaticAssetUrl(`${NAMA_BUNDLE_DIR}${fileName}`)
+  if (!path) {
+    throw new Error(`bundle 路径无效: ${fileName}`)
+  }
+  const exists = await pathExists(path)
+  if (!exists) {
     throw new Error(
-      `无法解析 bundle: ${staticRelPath}。请将 ai_face_processor.bundle、face_beautification.bundle 放入 src/static/nama-bundle/ 后重新打包`,
+      `缺少 ${fileName}，请放入 src/static/nama-bundle/ 后重新云打包`,
     )
   }
   if (minBytes > 0) {
-    const size = await getFileSize(abs)
+    const size = await getFileSize(path)
     if (size > 0 && size < minBytes) {
-      throw new Error(`${staticRelPath} 过小(${size}B)，请重新 fetch 完整 AI bundle`)
+      throw new Error(
+        `${fileName} 过小(${size}B)，请确认 src/static/nama-bundle/ 内为完整 AI 包`,
+      )
     }
   }
-  return abs
+  return path
 }
 
 function parseNativeHandle(data: unknown): number {
@@ -318,6 +320,24 @@ function parseNativeHandle(data: unknown): number {
     }
   }
   return 0
+}
+
+/** loadAIModel 回调里带的 deviceLevel，优先于过早的 getDevicePerformanceLevel */
+function applyDeviceLevelFromNativeData(data: unknown) {
+  if (!data || typeof data !== 'object') {
+    return
+  }
+  const obj = data as Record<string, unknown>
+  let level: unknown = obj.deviceLevel
+  if (level == null && obj.data && typeof obj.data === 'object') {
+    level = (obj.data as Record<string, unknown>).deviceLevel
+  }
+  if (level != null) {
+    const n = Number(level)
+    if (n >= 1 && n <= 4) {
+      cachedDevicePerfLevel = n
+    }
+  }
 }
 
 export function isNamaReady() {
@@ -439,6 +459,14 @@ export function detachCameraOverlay() {
   return runWithTimeout<number>('hideCamera', { keepSession: false }, 5000)
 }
 
+/**
+ * 离开美颜页：普通会话 park；导航切换后的脏会话从窗口拆掉（保留 SDK）。
+ * 脏会话若只 park，首页 reset 会停采集却拆不掉 Surface，暂停帧挡住下一页。
+ */
+export function hideOrDetachCameraPreview() {
+  return hideCameraPreview()
+}
+
 export function pauseCameraPreview() {
   const mod = getNama()
   if (typeof mod.pauseCameraPreview !== 'function') {
@@ -517,10 +545,28 @@ export function getDevicePerformanceLevel() {
     2000,
   ).then((info) => {
     if (info?.level != null) {
-      cachedDevicePerfLevel = Math.max(-1, Math.min(4, Number(info.level) || 1))
+      const n = Number(info.level)
+      if (n >= 1 && n <= 4) {
+        cachedDevicePerfLevel = n
+      } else if (cachedDevicePerfLevel < 1 || cachedDevicePerfLevel > 4) {
+        cachedDevicePerfLevel = 1
+      }
     }
     return { ...info, level: cachedDevicePerfLevel }
   })
+}
+
+/** 首页统一申请相机+麦克风（iOS 走原生 requestPermissions，避免美颜页弹权） */
+export function requestNativePermissions(): Promise<{ camera?: boolean; microphone?: boolean }> {
+  const mod = getNama()
+  if (typeof mod.requestPermissions !== 'function') {
+    return Promise.resolve({})
+  }
+  return runWithTimeout<{ camera?: boolean; microphone?: boolean }>(
+    'requestPermissions',
+    undefined,
+    5000,
+  ).catch(() => ({}))
 }
 
 export function getCachedDevicePerfLevel() {
@@ -807,10 +853,10 @@ export function processStillImage(path: string, opts?: { maxSide?: number }) {
   if (local.startsWith('file://')) {
     local = local.slice(7)
   }
-  // iOS 预览也用较高边长，避免导入图美颜发糊；导出仍可显式传 1920
+  // iOS 预览边长：960 足够清晰且比 1280 快一截；导出可显式传更大
   let maxSide = opts?.maxSide
   if (maxSide == null && isIOSApp()) {
-    maxSide = 1280
+    maxSide = 960
   }
   const payload: Record<string, unknown> = { path: local }
   if (typeof maxSide === 'number' && maxSide > 0) {
@@ -851,6 +897,24 @@ export function pauseVideoPreview() {
     return Promise.resolve(0)
   }
   return runWithTimeout<number>('pauseVideoPreview', undefined, 3000)
+}
+
+/** 锁屏/回桌面：成对 GL onPause，保住 Nama */
+export function parkVideoForBackground() {
+  const mod = getNama()
+  if (typeof mod.parkVideoForBackground !== 'function') {
+    return pauseVideoPreview()
+  }
+  return runWithTimeout<number>('parkVideoForBackground', undefined, 3000)
+}
+
+/** 回前台：首帧 + Play（不 invalidate） */
+export function resetVideoToIdle() {
+  const mod = getNama()
+  if (typeof mod.resetVideoToIdle !== 'function') {
+    return Promise.resolve({ ok: 0 })
+  }
+  return runWithTimeout<{ ok?: number }>('resetVideoToIdle', undefined, 5000)
 }
 
 export function resumeVideoPreview() {
@@ -1281,12 +1345,12 @@ export async function initNamaSdk() {
 }
 
 export async function loadNamaAIModel() {
-  const { aiPath } = namaBundleStaticPaths()
-  const resolved = await ensureStaticBundle(aiPath, AI_BUNDLE_MIN_BYTES)
-  const raw = await run<unknown>('loadAIModel', { path: resolved })
+  const aiPath = await ensureStaticBundle(AI_BUNDLE_FILE, AI_BUNDLE_MIN_BYTES)
+  const raw = await run<unknown>('loadAIModel', { path: aiPath })
   if (raw && typeof raw === 'object') {
     printNamaSdkLog((raw as Record<string, unknown>).sdkLog)
   }
+  applyDeviceLevelFromNativeData(raw)
   const handle = parseNativeHandle(raw)
   if (handle <= 0) {
     throw new Error(`loadAIModel 无效 handle: ${JSON.stringify(raw)}`)
@@ -1295,9 +1359,8 @@ export async function loadNamaAIModel() {
 }
 
 export async function loadNamaBeautyBundle(pipeline: 'camera' | 'media' = 'camera') {
-  const { beautyPath } = namaBundleStaticPaths()
-  const resolved = await ensureStaticBundle(beautyPath)
-  const raw = await run<unknown>('loadBundle', { path: resolved, pipeline })
+  const beautyPath = await ensureStaticBundle(BEAUTY_BUNDLE_FILE)
+  const raw = await run<unknown>('loadBundle', { path: beautyPath, pipeline })
   if (raw && typeof raw === 'object') {
     printNamaSdkLog((raw as Record<string, unknown>).sdkLog)
   }
@@ -1369,6 +1432,7 @@ export async function initNamaForBeauty(
   if (cameraBeautyHandle > 0 && sdkInited) {
     namaReady = true
     onProgress?.('已初始化')
+    await getDevicePerformanceLevel().catch(() => undefined)
     return cameraBeautyHandle
   }
   if (beautyInitPromise) {
@@ -1377,14 +1441,15 @@ export async function initNamaForBeauty(
   }
   beautyInitPromise = (async () => {
     await ensureSdkAndAi(onProgress)
-    await getDevicePerformanceLevel().catch(() => undefined)
     if (cameraBeautyHandle > 0 && sdkInited) {
       namaReady = true
       onProgress?.('已初始化')
+      await getDevicePerformanceLevel().catch(() => undefined)
       return cameraBeautyHandle
     }
     onProgress?.('加载美颜资源...')
     const handle = await loadNamaBeautyBundle('camera')
+    await getDevicePerformanceLevel().catch(() => undefined)
     onProgress?.('初始化完成')
     return handle
   })()
@@ -1413,68 +1478,116 @@ function isAndroidApp(): boolean {
   }
 }
 
-type SdkAliveInfo = {
+type SdkAliveInfo = NamaSessionProbe & {
   alive?: boolean
-  libInit?: number
-  initialized?: boolean
-  cameraHandle?: number
-  mediaHandle?: number
   aiLoaded?: boolean
 }
 
+function currentJsNamaSession(): JsNamaSession {
+  return {
+    sdkInited,
+    cameraHandle: cameraBeautyHandle,
+    sessionDirty: androidNamaSessionDirty,
+  }
+}
+
+/** 切导航后半死：整进程冷启动，不修旧 overlay */
+function relaunchAndroidApp() {
+  try {
+    const mod = getNama()
+    if (typeof mod.relaunchProcess === 'function') {
+      void run('relaunchProcess').catch(() => undefined)
+      return
+    }
+  } catch {
+    // 旧基座无此方法
+  }
+  try {
+    if (typeof plus !== 'undefined' && plus.runtime && typeof plus.runtime.restart === 'function') {
+      plus.runtime.restart()
+    }
+  } catch {
+    // ignore
+  }
+}
+
 /**
- * Android：进程未杀死后重进时，JS sdkInited 可能与 native 脱节。
- * App onShow 调用；native 仍 alive 则跳过，否则 invalidate 并走完整 init。
+ * 首页核对 native 会话。Activity 已死 / JS 重载残留 overlay → 整进程重启。
+ * 仅库或 handle 丢了才就地 reinit。
  */
-export async function ensureAndroidNamaAlive(): Promise<void> {
+export async function ensureAndroidNamaSessionFresh(): Promise<boolean> {
   // #ifndef APP-PLUS
-  return
+  return false
   // #endif
   // #ifdef APP-PLUS
   if (!isAndroidApp() || !diagnoseNamaPlugin().ok) {
-    return
+    return false
   }
   const mod = getNama()
   if (typeof mod.isSdkAlive !== 'function') {
-    return
+    return false
   }
-  // 勿打断首页 preload / 美颜页 onLoad 正在进行的 init
   if (sdkInitPromise || beautyInitPromise) {
-    return
+    try {
+      await (sdkInitPromise || beautyInitPromise)
+    } catch {
+      // 预热失败仍继续探测
+    }
   }
-  const hadJsSession =
-    sdkInited || cameraBeautyHandle > 0 || mediaBeautyHandle > 0
+  let info: SdkAliveInfo = {}
   try {
-    const info = await run<SdkAliveInfo>('isSdkAlive')
-    const libOk = Number(info?.libInit) === 1 && info?.initialized !== false
-    const nativeHandle = Math.max(Number(info?.cameraHandle) || 0, Number(info?.mediaHandle) || 0)
-    if (libOk && (nativeHandle > 0 || cameraBeautyHandle > 0 || mediaBeautyHandle > 0)) {
-      if (nativeHandle > 0 && cameraBeautyHandle <= 0 && mediaBeautyHandle <= 0) {
-        cameraBeautyHandle = Number(info?.cameraHandle) || nativeHandle
-        mediaBeautyHandle = Number(info?.mediaHandle) || 0
-        namaReady = activeBeautyHandle() > 0
-      }
-      if (!sdkInited && libOk) {
-        sdkInited = true
-      }
-      return
-    }
-    // 冷启动：native/JS 都未就绪时交给 preload / 进页 init，避免 invalidate 竞态
-    if (!hadJsSession) {
-      return
-    }
+    info = (await run<SdkAliveInfo>('isSdkAlive')) || {}
   } catch {
-    if (!hadJsSession) {
-      return
-    }
+    info = {}
+  }
+  if (shouldMarkAndroidNamaSessionDirty(info, currentJsNamaSession())) {
+    androidNamaSessionDirty = true
+  }
+  const jsState = currentJsNamaSession()
+  const relaunchReason = androidNamaRelaunchReason(info, jsState)
+  if (relaunchReason) {
+    console.log('[FU] relaunch Android process', relaunchReason, {
+      overlayMounted: info.overlayMounted,
+      overlayActDead: info.overlayActDead,
+      overlaySurfaceValid: info.overlaySurfaceValid,
+      contextAlive: info.contextAlive,
+    })
+    relaunchAndroidApp()
+    return true
+  }
+  if (!shouldReinitAndroidNamaSession(info, jsState)) {
+    return false
+  }
+  const reason = androidNamaReinitReason(info, jsState) || 'unknown'
+  console.log('[FU] reinit Nama session on home check', reason, {
+    overlayMounted: info.overlayMounted,
+    overlayActDead: info.overlayActDead,
+    overlaySurfaceValid: info.overlaySurfaceValid,
+    jsHandle: cameraBeautyHandle,
+    nativeHandle: info.cameraHandle,
+    sdkInited,
+    sessionDirty: androidNamaSessionDirty,
+  })
+  androidNamaSessionDirty = true
+  try {
+    await run('resetStaleOverlays')
+  } catch {
+    // 旧基座可能没有此方法
   }
   invalidateNamaSession()
+  androidNamaSessionDirty = true
   try {
     await initNamaForBeauty()
   } catch {
-    // 首页 onShow 静默失败，进页再 init
+    // 首页静默失败，进美颜页再 init
   }
+  return true
   // #endif
+}
+
+/** App.onShow：与首页同一套探测，避免只在冷启动 reset 却不重新 init */
+export async function ensureAndroidNamaAlive(): Promise<void> {
+  await ensureAndroidNamaSessionFresh()
 }
 
 /** 媒体图/视频管线；复用首页/相机已 load 的 beauty handle，避免二次 loadBundle */
@@ -1496,11 +1609,14 @@ export async function initNamaForMedia(
 
   if (mediaBeautyHandle > 0) {
     namaReady = true
-    // 已有 media handle 且与相机同源 → 仍视为复用，跳过全量写参
     if (cameraBeautyHandle > 0 && mediaBeautyHandle === cameraBeautyHandle) {
       mediaReusedCameraSession = true
     }
     onProgress?.('媒体管线已初始化')
+    // 安卓保留机型刷新；iOS 媒体页用缓存档位，避免多一次桥接拖慢进页
+    if (!isIOSApp()) {
+      await getDevicePerformanceLevel().catch(() => undefined)
+    }
     return mediaBeautyHandle
   }
 
@@ -1512,18 +1628,30 @@ export async function initNamaForMedia(
     try {
       const mod = getNama()
       if (typeof mod.bindMediaBeautyHandle === 'function') {
-        await run('bindMediaBeautyHandle', { handle: cameraBeautyHandle }).catch(() => undefined)
+        const bindP = run('bindMediaBeautyHandle', { handle: cameraBeautyHandle }).catch(
+          () => undefined,
+        )
+        // iOS 媒体页先出面板：bind 后台完成即可，勿多挡一轮桥接
+        if (isIOSApp()) {
+          void bindP
+        } else {
+          await bindP
+        }
       }
     } catch {
       // 旧基座无此方法时仍用 JS handle 写参
     }
     onProgress?.('复用相机美颜会话')
+    if (!isIOSApp()) {
+      await getDevicePerformanceLevel().catch(() => undefined)
+    }
     return mediaBeautyHandle
   }
 
   await ensureSdkAndAi(onProgress)
   onProgress?.('加载媒体美颜资源...')
   const handle = await loadNamaBeautyBundle('media')
+  await getDevicePerformanceLevel().catch(() => undefined)
   mediaReusedCameraSession = false
   onProgress?.('初始化完成')
   return handle
@@ -1562,6 +1690,26 @@ export function setPreviewChromeRecording(recording: boolean) {
   const mod = getNama()
   if (typeof mod.setPreviewChromeRecording !== 'function') return Promise.resolve(0)
   return run<number>('setPreviewChromeRecording', { recording })
+}
+
+/** 把 /static/... 转成原生 UIImage 可读的 file:// 绝对路径 */
+function resolveStaticAssetUrl(relPath: string): string {
+  if (!relPath) return ''
+  if (relPath.startsWith('http://') || relPath.startsWith('https://') || relPath.startsWith('file://')) {
+    return relPath
+  }
+  // #ifdef APP-PLUS
+  try {
+    const local = `_www${relPath.startsWith('/') ? relPath : `/${relPath}`}`
+    const abs = plus.io.convertLocalFileSystemURL(local)
+    if (abs) {
+      return abs.startsWith('file://') ? abs : `file://${abs}`
+    }
+  } catch {
+    // ignore
+  }
+  // #endif
+  return relPath
 }
 
 /** 面板图标：优先转绝对路径；安卓原生仍可扫 www/static 兜底 */

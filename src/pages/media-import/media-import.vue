@@ -116,9 +116,14 @@ async function onChooseType(type: 'image' | 'video') {
   }
   picking.value = true
   try {
-    await setOverlayWindowsHidden(true).catch(() => undefined)
-    await pauseCameraPreview().catch(() => undefined)
-    await sleep(80)
+    if (isIOSPlatform()) {
+      void setOverlayWindowsHidden(true).catch(() => undefined)
+      void pauseCameraPreview().catch(() => undefined)
+    } else {
+      await setOverlayWindowsHidden(true).catch(() => undefined)
+      await pauseCameraPreview().catch(() => undefined)
+      await sleep(80)
+    }
 
     // iOS：UIImagePicker 需要相册权限
     // Android：OPEN_DOCUMENT 对齐 Demo，不依赖 READ_MEDIA_*（避免空相册）
@@ -165,13 +170,21 @@ async function onChooseType(type: 'image' | 'video') {
       return
     }
 
-    const local = await ensureLocalMediaFile(
-      path,
-      type === 'video' ? '.mp4' : '.jpg',
-    )
-    goMediaBeauty(type, local)
+    if (isIOSPlatform()) {
+      // pickMedia 已落 /tmp，直接跳转
+      const plain = path.startsWith('file://') ? path.slice(7) : path
+      goMediaBeauty(type, plain)
+    } else {
+      const local = await ensureLocalMediaFile(
+        path,
+        type === 'video' ? '.mp4' : '.jpg',
+      )
+      goMediaBeauty(type, local)
+    }
   } finally {
-    await sleep(400)
+    if (!isIOSPlatform()) {
+      await sleep(400)
+    }
     picking.value = false
   }
   // #endif
