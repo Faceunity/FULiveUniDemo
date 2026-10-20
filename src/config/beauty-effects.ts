@@ -1,7 +1,6 @@
-/** nama-web OSS 滤镜预览图（与 WebDemo 一致） */
-export const NAMA_CDN_BASE = 'https://fu-sdk.oss-cn-hangzhou.aliyuncs.com/WebDemo/prod'
-
 const ICON_DIR = '/static/beauty-icons'
+/** 滤镜预览图（对齐 iOS FULiveDemo FUBeautyComponent.xcassets/Filter） */
+const FILTER_ICON_DIR = '/static/filter-icons'
 
 /** 美颜参数项：UI 滑杆 [sliderMin, sliderMax] 映射到 SDK [min, max]（对齐 nama-web） */
 export type BeautyEffectItem = {
@@ -43,8 +42,6 @@ export type FilterPreset = {
   name: string
   /** filter_name 参数值（必须带编号，如 ziran1） */
   key: string
-  /** CDN demo_icon 文件名（不含扩展名） */
-  cdnIconKey?: string
 }
 
 function iconPath(base: string) {
@@ -241,9 +238,9 @@ export const FILTER_LEVEL_ITEM: BeautyEffectItem = {
   iconBase: 'MobMopi',
 }
 
-export const FILTER_ORIGIN_ICON = `${ICON_DIR}/original.png`
+export const FILTER_ORIGIN_ICON = `${FILTER_ICON_DIR}/origin.png`
 
-/** 滤镜系列：key 前缀 + 数量（与 nama-web filterList 一致） */
+/** 滤镜系列：key 前缀 + 数量（与 FULiveDemo beauty_filter.json 一致） */
 const FILTER_SERIES: { prefix: string; label: string; count: number }[] = [
   { prefix: 'ziran', label: '自然', count: 8 },
   { prefix: 'zhiganhui', label: '质感灰', count: 8 },
@@ -266,7 +263,6 @@ function buildFilterPresets(): FilterPreset[] {
         id: key,
         name: `${series.label}${i}`,
         key,
-        cdnIconKey: key,
       })
     }
   }
@@ -283,11 +279,7 @@ export const FILTER_ORIGIN_PRESET = FILTER_PRESETS[0]
 export const FILTER_SCROLL_PRESETS = FILTER_PRESETS.filter((f) => f.id !== 'origin')
 
 export function getFilterIconUrl(filter: FilterPreset): string {
-  if (filter.id === 'origin') {
-    return FILTER_ORIGIN_ICON
-  }
-  const key = filter.cdnIconKey ?? filter.key
-  return `${NAMA_CDN_BASE}/demo_icon_${key}.png`
+  return `${FILTER_ICON_DIR}/${filter.key}.png`
 }
 
 /** 默认滤镜：nama-web 取 filterList[0] = ziran1 */
@@ -295,43 +287,6 @@ export const DEFAULT_FILTER_ID = 'ziran1'
 
 export function getFilterPresetById(id: string) {
   return FILTER_PRESETS.find((f) => f.id === id) ?? FILTER_PRESETS[1]
-}
-
-/** 各滤镜独立强度槽位（对齐原生 filter_level:ziran1） */
-export function filterLevelStorageKey(filterId: string): string {
-  if (!filterId || filterId === 'origin') {
-    return 'filter_level'
-  }
-  return `filter_level:${filterId}`
-}
-
-/** 读取某滤镜 UI 滑杆值（0~100） */
-export function getFilterLevelSliderUi(values: Record<string, number>, filterId: string): number {
-  const key = filterLevelStorageKey(filterId)
-  if (values[key] != null) {
-    return values[key]
-  }
-  if (values.filter_level != null) {
-    return values.filter_level
-  }
-  return defaultSliderValue(FILTER_LEVEL_ITEM)
-}
-
-/** 写入某滤镜 UI 滑杆值 */
-export function setFilterLevelSliderUi(
-  values: Record<string, number>,
-  filterId: string,
-  ui: number,
-) {
-  values[filterLevelStorageKey(filterId)] = ui
-}
-
-/** 把全局 filter_level 迁移到指定滤镜槽位（仅槽位为空时） */
-export function migrateGlobalFilterLevel(values: Record<string, number>, filterId: string) {
-  const key = filterLevelStorageKey(filterId)
-  if (values[key] == null && values.filter_level != null) {
-    values[key] = values.filter_level
-  }
 }
 
 /** 全部滑杆项（初始化用） */

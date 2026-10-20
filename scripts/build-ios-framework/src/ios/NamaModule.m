@@ -1,13 +1,15 @@
 #import "NamaModule.h"
-#import "core/CNamaSDK.h"
 #import "DCUniDefine.h"
-#import "auth/authpack.h"
-#import "core/BeautyCameraView.h"
-#import "core/BeautyVideoView.h"
-#import "ui/PreviewChromeView.h"
-#import "ui/FuBeautyPanelView.h"
-#import <sys/sysctl.h>
-#import <TargetConditionals.h>
+#import "authpack.h"
+#import "FURenderKitCameraView.h"
+#import <FURenderKit/FURenderKit.h>
+#import <FURenderKit/FUAIKit.h>
+#import <FURenderKit/FUGLDisplayView.h>
+#import <FURenderKit/FUImageHelper.h>
+#import <FURenderKit/FUBeauty.h>
+#import "BeautyVideoView.h"
+#import "PreviewChromeView.h"
+#import "FuBeautyPanelView.h"
 
 // 运行时取类，避免 slim 漏链 PreviewChromeView.o 时留下未定义 _OBJC_CLASS_$_ 导致基座加载即闪退
 static Class FuPreviewChromeViewClass(void) {
@@ -26,265 +28,77 @@ static Class FuBeautyPanelViewClass(void) {
     });
     return cls;
 }
-#import "core/VideoBeautyExporter.h"
+#import "VideoBeautyExporter.h"
 
 #import <string.h>
-#import "core/FuBeautyHandle.h"
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <OpenGLES/EAGL.h>
 #import <Photos/Photos.h>
 #import <MobileCoreServices/MobileCoreServices.h>
+#import <PhotosUI/PhotosUI.h>
 #import <stdbool.h>
 
 #define FU_LOG(fmt, ...) do { } while (0)
 /** PreviewChrome 拍摄/对比按钮 tag，overlay hitTest 放行 */
 static const NSInteger kFuChromeInteractiveTag = 88219901;
 
-/** 对齐 Android FuExportProgressHud：圆环 + 百分比 */
-@interface FuExportProgressRingView : UIView
-@property (nonatomic, assign) CGFloat progress;
-@end
-@implementation FuExportProgressRingView
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.backgroundColor = [UIColor clearColor];
-        self.opaque = NO;
-    }
-    return self;
-}
-- (void)setProgress:(CGFloat)progress {
-    _progress = MAX(0.f, MIN(1.f, progress));
-    [self setNeedsDisplay];
-}
-- (void)drawRect:(CGRect)rect {
-    CGFloat lineW = 4.f;
-    CGRect oval = CGRectInset(rect, 10.f, 10.f);
-    CGPoint c = CGPointMake(CGRectGetMidX(oval), CGRectGetMidY(oval));
-    CGFloat r = CGRectGetWidth(oval) * 0.5f;
-    UIBezierPath *bg = [UIBezierPath bezierPathWithArcCenter:c radius:r startAngle:0 endAngle:(CGFloat)(2.0 * M_PI) clockwise:YES];
-    bg.lineWidth = lineW;
-    [[UIColor colorWithWhite:1 alpha:0.27] setStroke];
-    [bg stroke];
-    if (_progress <= 0.0001f) {
-        return;
-    }
-    UIBezierPath *arc = [UIBezierPath bezierPathWithArcCenter:c
-                                                      radius:r
-                                                  startAngle:(CGFloat)(-M_PI_2)
-                                                    endAngle:(CGFloat)(-M_PI_2 + 2.0 * M_PI * _progress)
-                                                   clockwise:YES];
-    arc.lineWidth = lineW;
-    arc.lineCapStyle = kCGLineCapRound;
-    [[UIColor colorWithRed:0.369 green:0.780 blue:0.996 alpha:1] setStroke];
-    [arc stroke];
-}
-@end
-
 int FuBeautyCameraHandle = 0;
 int FuBeautyMediaHandle = 0;
 int FuBeautyItemHandle = 0;
-static BOOL sAdvancedBeautyGlReady = NO;
-static BOOL sAdvancedBeautySetUseApplied = NO;
 
-/** 关闭 SDK 文件/控制台日志（DEBUG 写盘会拖慢预览） */
-static void FuDisableSdkLogging(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fuSetLogLevel(FU_LOG_LEVEL_OFF);
-    });
+static int FuBeautyHandleForPipeline(BOOL media) {
+    return media ? FuBeautyMediaHandle : FuBeautyCameraHandle;
 }
 
-static int FuItemSetParamdLogged(int handle, const char *name, double value) {
-    return fuItemSetParamd(handle, name, value);
-}
-
-static int FuItemSetParamsLogged(int handle, const char *name, const char *value) {
-    return fuItemSetParams(handle, name, value);
-}
-
-static int sResolvedSdkDeviceLevel = 0;
-static int sHardwareDeviceLevel = 0;
-
-static NSString *FuHardwareMachineId(void) {
-    size_t size = 0;
-    if (sysctlbyname("hw.machine", NULL, &size, NULL, 0) != 0 || size == 0) {
-        return @"";
+/** 设备性能分级缓存（对齐 FULiveDemo：Low…4 Excellent；皮肤美白仅 Excellent） */
+static int FuDevicePerformanceLevelCached(void) {
+    static int sLevel = 0;
+    static BOOL sHasValue = NO;
+    if (sHasValue) {
+        return sLevel;
     }
-    char *machine = (char *)malloc(size);
-    if (!machine) {
-        return @"";
-    }
-    if (sysctlbyname("hw.machine", machine, &size, NULL, 0) != 0) {
-        free(machine);
-        return @"";
-    }
-    NSString *result = [NSString stringWithUTF8String:machine] ?: @"";
-    free(machine);
-    return result;
-}
-
-/** 对齐 Android MediaFuSetup RAM 分档（未知机型兜底） */
-static int FuDevicePerformanceLevelFromRamGb(double memGb) {
-    if (memGb <= 0) {
-        return 1;
-    }
-    if (memGb < 2.0) {
-        return 1;
-    }
-    if (memGb < 4.0) {
-        return 1;
-    }
-    if (memGb < 7.0) {
-        return 2;
-    }
-    if (memGb < 11.5) {
-        return 3;
-    }
-    return 4;
-}
-
-/**
- * iOS 机型分级（不用 fuGetDeviceLevel）：
- * iPhone 8 / X 档 → 2；iPhone 11 档 → 3；iPhone 12+ → 4；更老 → 1
- * 内部型号：iPhone12,x=11；iPhone13,x=12 全系；iPhone14,x 起为 13/14…
- */
-static int FuDevicePerformanceLevelFromHardware(void) {
-#if TARGET_OS_SIMULATOR
-    return 4;
-#endif
-    NSString *machine = FuHardwareMachineId();
-    if (machine.length == 0) {
-        double ramGb = NSProcessInfo.processInfo.physicalMemory / (1024.0 * 1024.0 * 1024.0);
-        return FuDevicePerformanceLevelFromRamGb(ramGb);
-    }
-    if ([machine hasPrefix:@"iPhone"]) {
-        NSString *suffix = [machine substringFromIndex:6];
-        int major = 0;
-        sscanf([suffix UTF8String], "%d", &major);
-        if (major >= 13) {
-            return 4; // iPhone 12 及更新机型（含 12/12 mini/12 Pro/12 Pro Max）
+    int level = 4;
+    @try {
+        FUDevicePerformanceLevel perf = [FURenderKit devicePerformanceLevel];
+        switch (perf) {
+            case FUDevicePerformanceLevelExcellent:
+                level = 4;
+                break;
+            case FUDevicePerformanceLevelVeryHigh:
+                level = 3;
+                break;
+            case FUDevicePerformanceLevelHigh:
+                level = 2;
+                break;
+            default:
+                level = 1;
+                break;
         }
-        if (major >= 12) {
-            return 3; // iPhone 11 全系
-        }
-        if (major >= 10) {
-            return 2; // iPhone 8 / X / XS / XR
-        }
-        return 1;
+    } @catch (__unused NSException *e) {
+        level = 4;
     }
-    if ([machine hasPrefix:@"iPad"]) {
-        NSString *suffix = [machine substringFromIndex:4];
-        int major = 0;
-        sscanf([suffix UTF8String], "%d", &major);
-        if (major >= 13) {
-            return 4;
-        }
-        if (major >= 8) {
-            return 3;
-        }
-        return 2;
-    }
-    double ramGb = NSProcessInfo.processInfo.physicalMemory / (1024.0 * 1024.0 * 1024.0);
-    return FuDevicePerformanceLevelFromRamGb(ramGb);
+    sLevel = level;
+    sHasValue = YES;
+    return sLevel;
 }
 
-static int FuResolveDevicePerformanceLevel(void) {
-    if (sHardwareDeviceLevel >= 1 && sHardwareDeviceLevel <= 4) {
-        return sHardwareDeviceLevel;
+/** 对齐 Android MediaFuSetup.isBeautyFeatureSupported / Demo canUseFunction */
+static BOOL FuBeautyParamAllowedOnDevice(NSString *key) {
+    if (key.length == 0) {
+        return YES;
     }
-    int level = FuDevicePerformanceLevelFromHardware();
-    if (level < 1 || level > 4) {
-        level = 1;
+    int level = FuDevicePerformanceLevelCached();
+    if ([key isEqualToString:@"body_blur_level"]) {
+        return level >= 4;
     }
-    sHardwareDeviceLevel = level;
-    sResolvedSdkDeviceLevel = level;
-    FU_LOG("devicePerformanceLevel=%d machine=%@ ramGb=%.2f",
-           level,
-           FuHardwareMachineId(),
-           NSProcessInfo.processInfo.physicalMemory / (1024.0 * 1024.0 * 1024.0));
-    return level;
-}
-
-int FuDevicePerformanceLevelCached(void) {
-    return FuResolveDevicePerformanceLevel();
-}
-
-int FuClampedDevicePerformanceLevel(void) {
-    return FuResolveDevicePerformanceLevel();
-}
-
-void FuRefreshDevicePerformanceLevelFromSdk(void) {
-    sHardwareDeviceLevel = 0;
-    FuResolveDevicePerformanceLevel();
-}
-
-int FuBeautyPerfGateRequiredLevel(const char *key) {
-    if (!key || !key[0]) {
-        return -1;
+    if ([key isEqualToString:@"delspot_level"] || [key isEqualToString:@"facial_plump"]) {
+        return level >= 3;
     }
-    typedef struct {
-        const char *k;
-        int level;
-    } FuPerfGateEntry;
-    static const FuPerfGateEntry kTable[] = {
-        {"blur_level", -1},
-        {"body_blur_level", 4},
-        {"delspot_level", 3},
-        {"facial_plump", 3},
-        {"color_level", 1},
-        {"color_level_mode2", 1},
-        {"red_level", 1},
-        {"clarity", 1},
-        {"sharpen", 1},
-        {"face_threed", 1},
-        {"eye_bright", 1},
-        {"tooth_whiten", 1},
-        {"remove_pouch_strength", 1},
-        {"remove_pouch_strength_mode2", 1},
-        {"remove_nasolabial_folds_strength", 1},
-        {"remove_nasolabial_folds_strength_mode2", 1},
-        {"enable_skinseg", 4},
-        {"cheek_thinning", -1},
-        {"cheek_v", 1},
-        {"cheek_narrow", 1},
-        {"cheek_narrow_mode2", 1},
-        {"cheek_short", 1},
-        {"cheek_small", 1},
-        {"cheek_small_mode2", 1},
-        {"intensity_cheekbones", 1},
-        {"intensity_lower_jaw", 1},
-        {"eye_enlarging", -1},
-        {"eye_enlarging_mode3", -1},
-        {"intensity_eye_circle", 1},
-        {"intensity_eye_pupil", -1},
-        {"intensity_chin", 1},
-        {"intensity_forehead", 1},
-        {"intensity_forehead_mode2", 1},
-        {"intensity_nose", -1},
-        {"intensity_nose_mode2", -1},
-        {"intensity_mouth", 1},
-        {"intensity_mouth_mode3", 1},
-        {"intensity_lip_thick", 2},
-        {"intensity_eye_height", 2},
-        {"intensity_canthus", 1},
-        {"intensity_eye_lid", 2},
-        {"intensity_eye_space", 1},
-        {"intensity_eye_rotate", 1},
-        {"intensity_long_nose", 1},
-        {"intensity_philtrum", 1},
-        {"intensity_smile", 1},
-        {"intensity_brow_height", 2},
-        {"intensity_brow_space", 2},
-        {"intensity_brow_thick", 2},
-    };
-    for (size_t i = 0; i < sizeof(kTable) / sizeof(kTable[0]); i++) {
-        if (strcmp(key, kTable[i].k) == 0) {
-            return kTable[i].level;
-        }
+    if ([key isEqualToString:@"enable_skinseg"]) {
+        return level >= 4;
     }
-    return -1;
+    return YES;
 }
 
 void FuBeautySetPipelineHandle(BOOL media, int handle) {
@@ -311,12 +125,6 @@ void FuBeautyClearAll(void) {
     FuBeautyItemHandle = 0;
 }
 
-void FuSetAdvancedBeautyGlReady(BOOL ready) {
-    sAdvancedBeautyGlReady = ready ? YES : NO;
-    if (!ready) {
-        sAdvancedBeautySetUseApplied = NO;
-    }
-}
 
 /**
  * 公开侧运行时参数。 * 切勿调用 FUAI_FaceProcessorSetUse*：未公开 API，多处时机都会空指针闪退。 * 切勿在此强制 enable_skinseg=0：会冲掉前端「仅皮肤 / 全局」分段。 */
@@ -345,46 +153,6 @@ void FuSetExposureNormalizedForBlur(double normalized01) {
     }
 }
 
-/** 官方文档：blur_use_mask 仅在 blur_type==2（精细磨皮）时生效；type=3 时开 mask 会出灰蒙。
- * 对齐 Android：按机型写一次默认；全身磨皮开启时强制关 mask，关闭后恢复机型默认。 */
-void FuUpdateBeautyBlurEffect(int beautyHandle) {
-    if (beautyHandle <= 0 || fuIsLibraryInit() == 0) {
-        return;
-    }
-    int level = FuDevicePerformanceLevelCached();
-    if (level < 1 || level > 4) {
-        level = 1;
-    }
-    int wantType;
-    int wantMask;
-    if (level >= 3) {
-        // 高端：均匀磨皮 EquallySkinFine；mask 必须关
-        wantType = 3;
-        wantMask = 0;
-    } else {
-        // 中低端：官方推荐精细磨皮 + 人脸 mask
-        wantType = 2;
-        wantMask = 1;
-    }
-    // 全身磨皮与人脸 mask 叠加会灰蒙；开启时关 mask，关掉后应恢复机型默认
-    double bodyBlur = fuItemGetParamd(beautyHandle, "body_blur_level");
-    if (bodyBlur > 0.001) {
-        wantMask = 0;
-    }
-    // 对齐 Android applyBlurForExposure：极端曝光下均匀磨皮会出密密麻麻闪点
-    if (sExposureNormForBlur < 0.45 || sExposureNormForBlur > 0.58) {
-        wantType = 2;
-        wantMask = 0;
-    }
-    if (wantType != sLastBlurType || wantMask != sLastBlurMask) {
-        FuItemSetParamdLogged(beautyHandle, "heavy_blur", 0.0);
-        FuItemSetParamdLogged(beautyHandle, "blur_type", (double)wantType);
-        FuItemSetParamdLogged(beautyHandle, "blur_use_mask", (double)wantMask);
-        sLastBlurType = wantType;
-        sLastBlurMask = wantMask;
-    }
-}
-
 /** 特效写参前轻量确认公开开关（对齐 Android ensureAdvancedBeautySwitches）；不重置磨皮缓存 */
 static volatile BOOL sBeautyChangeFramesHoldZero = NO;
 
@@ -397,182 +165,7 @@ BOOL FuBeautyChangeFramesHoldZero(void) {
 }
 
 double FuBeautyChangeFramesValue(void) {
-    (void)sBeautyChangeFramesHoldZero;
-    return 0.0;
-}
-
-void FuEnsureAdvancedBeautySwitches(int beautyHandle) {
-    if (beautyHandle <= 0) {
-        return;
-    }
-    FuItemSetParamdLogged(beautyHandle, "disable_delspot", 0.0);
-    FuItemSetParamdLogged(beautyHandle, "heavy_blur", 0.0);
-    FuItemSetParamdLogged(beautyHandle, "skin_detect", 0.0);
-    FuItemSetParamdLogged(beautyHandle, "face_shape", 4.0);
-    FuItemSetParamdLogged(beautyHandle, "face_shape_level", 1.0);
-    FuItemSetParamdLogged(beautyHandle, "change_frames", FuBeautyChangeFramesValue());
-    FuItemSetParamdLogged(beautyHandle, "enable_warp_anti_alias", 1.0);
-    FuItemSetParamdLogged(beautyHandle, "warp_anti_alias", 1.0);
-}
-
-static NSMutableDictionary<NSString *, NSNumber *> *sSpecialBeautyCache;
-
-static NSString *FuSpecialCacheKey(int beautyHandle, const char *key) {
-    return [NSString stringWithFormat:@"%d:%s", beautyHandle, key ?: ""];
-}
-
-void FuCacheSpecialBeautyValue(int beautyHandle, const char *key, double value) {
-    if (beautyHandle <= 0 || !key) {
-        return;
-    }
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        sSpecialBeautyCache = [NSMutableDictionary dictionary];
-    });
-    @synchronized (sSpecialBeautyCache) {
-        sSpecialBeautyCache[FuSpecialCacheKey(beautyHandle, key)] = @(value);
-    }
-}
-
-double FuCachedSpecialBeautyValue(int beautyHandle, const char *key) {
-    if (beautyHandle <= 0 || !key || !sSpecialBeautyCache) {
-        return 0.0;
-    }
-    @synchronized (sSpecialBeautyCache) {
-        NSNumber *n = sSpecialBeautyCache[FuSpecialCacheKey(beautyHandle, key)];
-        return n ? n.doubleValue : 0.0;
-    }
-}
-
-static BOOL FuHasCachedSpecialBeautyValue(int beautyHandle, const char *key) {
-    if (beautyHandle <= 0 || !key || !sSpecialBeautyCache) {
-        return NO;
-    }
-    @synchronized (sSpecialBeautyCache) {
-        return sSpecialBeautyCache[FuSpecialCacheKey(beautyHandle, key)] != nil;
-    }
-}
-
-static double FuEffectiveSpecialValue(int beautyHandle, const char *key) {
-    // 用户滑杆写入 cache 后优先信 cache，避免 SDK 帧间把 facial_plump 等清回 0
-    if (FuHasCachedSpecialBeautyValue(beautyHandle, key)) {
-        return FuCachedSpecialBeautyValue(beautyHandle, key);
-    }
-    return fuItemGetParamd(beautyHandle, key);
-}
-
-BOOL FuIsDelspotOrPlumpActive(int beautyHandle) {
-    if (beautyHandle <= 0) {
-        return NO;
-    }
-    return FuEffectiveSpecialValue(beautyHandle, "delspot_level") > 0.001
-        || FuEffectiveSpecialValue(beautyHandle, "facial_plump") > 0.001;
-}
-
-BOOL FuIsSpecialBeautyParamName(const char *key) {
-    if (!key) {
-        return NO;
-    }
-    return strcmp(key, "body_blur_level") == 0 ||
-        strcmp(key, "delspot_level") == 0 ||
-        strcmp(key, "facial_plump") == 0 ||
-        strcmp(key, "intensity_eye_pupil") == 0 ||
-        strcmp(key, "enable_skinseg") == 0;
-}
-
-/** 批量 flush 时用：不再重复 FuEnsureAdvancedBeautySwitches */
-void FuApplyBeautyParamDirectOnGl(int beautyHandle, const char *key, double value) {
-    if (beautyHandle <= 0 || !key) {
-        return;
-    }
-    if (strcmp(key, "enable_skinseg") == 0) {
-        fuItemSetParamd(beautyHandle, "enable_skinseg", value);
-        return;
-    }
-    fuItemSetParamd(beautyHandle, key, value);
-    if (strcmp(key, "eye_bright") == 0) {
-        fuItemSetParamd(beautyHandle, "eye_bright_v2", value);
-    }
-    // 对齐 Android applySpecialAlgoParam：写强度 → disable_delspot → 回写强度
-    if (strcmp(key, "facial_plump") == 0 || strcmp(key, "delspot_level") == 0) {
-        fuItemSetParamd(beautyHandle, "disable_delspot", 0.0);
-        if (strcmp(key, "facial_plump") == 0) {
-            fuItemSetParamd(beautyHandle, "facial_plump", value);
-        } else {
-            fuItemSetParamd(beautyHandle, "delspot_level", value);
-        }
-    } else if (FuIsSpecialBeautyParamName(key)) {
-        fuItemSetParamd(beautyHandle, "disable_delspot", 0.0);
-    }
-    if (strcmp(key, "body_blur_level") == 0) {
-        FuResetBeautyBlurCache();
-        FuUpdateBeautyBlurEffect(beautyHandle);
-    }
-    FuCacheSpecialBeautyValue(beautyHandle, key, value);
-}
-
-/** 对齐 Android BeautyParamApplier.applySpecialAlgoParam */
-void FuApplySpecialBeautyParamOnGl(int beautyHandle, const char *key, double value) {
-    if (beautyHandle <= 0 || !key) {
-        return;
-    }
-    FuEnsureAdvancedBeautySwitches(beautyHandle);
-    FuApplyBeautyParamDirectOnGl(beautyHandle, key, value);
-}
-
-/** 滑杆拖动时 ValueChanged 可能节流，SDK 也可能帧间清 facial_plump 等；每帧用 cache+get 重 latch */
-void FuReconfirmSpecialBeautySwitches(int beautyHandle) {
-    if (beautyHandle <= 0) {
-        return;
-    }
-    double plump = FuEffectiveSpecialValue(beautyHandle, "facial_plump");
-    // 对齐 Android reconfirmBeforeRender：只写 disable_delspot + 强度
-    fuItemSetParamd(beautyHandle, "disable_delspot", 0.0);
-    fuItemSetParamd(beautyHandle, "facial_plump", plump);
-    double delspot = FuEffectiveSpecialValue(beautyHandle, "delspot_level");
-    if (delspot > 0.001) {
-        fuItemSetParamd(beautyHandle, "disable_delspot", 0.0);
-        fuItemSetParamd(beautyHandle, "delspot_level", delspot);
-    }
-    double pupil = FuEffectiveSpecialValue(beautyHandle, "intensity_eye_pupil");
-    if (pupil > 0.001) {
-        fuItemSetParamd(beautyHandle, "disable_delspot", 0.0);
-        fuItemSetParamd(beautyHandle, "intensity_eye_pupil", pupil);
-    }
-    double skinseg = FuEffectiveSpecialValue(beautyHandle, "enable_skinseg");
-    if (skinseg > 0.001) {
-        fuItemSetParamd(beautyHandle, "enable_skinseg", skinseg);
-    }
-    double eyeBright = FuEffectiveSpecialValue(beautyHandle, "eye_bright");
-    if (eyeBright > 0.001) {
-        fuItemSetParamd(beautyHandle, "eye_bright", eyeBright);
-        fuItemSetParamd(beautyHandle, "eye_bright_v2", eyeBright);
-    }
-}
-
-void FuEnableAdvancedBeautyRuntime(int beautyHandle) {
-    if (beautyHandle <= 0) {
-        return;
-    }
-    FuEnsureAdvancedBeautySwitches(beautyHandle);
-    FuResetBeautyBlurCache();
-    FuUpdateBeautyBlurEffect(beautyHandle);
-}
-
-/** 首帧 fuRender 成功后再开未公开 SetUse*（须在持有Nama GL current 的渲染线程调用） */
-void FuTryApplyAdvancedBeautySetUseAfterRender(int beautyHandle) {
-    (void)beautyHandle;
-    // 未公开 SetUse* 已禁用（会闪退）；仅保留公开道具参数边沿触发
-    if (!sAdvancedBeautyGlReady || !fuIsAIModelLoaded(FUAITYPE_FACEPROCESSOR)) {
-        return;
-    }
-    if (!sAdvancedBeautySetUseApplied) {
-        int h = beautyHandle > 0 ? beautyHandle : FuBeautyCameraHandle;
-        if (h > 0) {
-            FuItemSetParamdLogged(h, "disable_delspot", 0.0);
-        }
-        sAdvancedBeautySetUseApplied = YES;
-    }
+    return sBeautyChangeFramesHoldZero ? 0.0 : 12.0;
 }
 
 /** 仅命中曝光滑杆，其余触摸穿透到下层业务窗WebView（对齐Android PopupWindow）*/
@@ -641,7 +234,7 @@ void FuTryApplyAdvancedBeautySetUseAfterRender(int beautyHandle) {
 }
 @end
 
-static BeautyCameraView *sOverlayCameraView = nil;
+static FURenderKitCameraView *sOverlayCameraView = nil;
 static UIView *sOverlayCameraHost = nil;
 static BOOL sCameraHostedByComponent = NO;
 static BeautyVideoView *sOverlayVideoView = nil;
@@ -649,11 +242,7 @@ static UIView *sOverlayVideoHost = nil;
 static UIButton *sOverlayVideoPlayBtn = nil;
 static UIWindow *sExportProgressWindow = nil;
 static UIView *sExportProgressHud = nil;
-static UILabel *sExportProgressPercentLabel = nil;
-static UILabel *sExportProgressTipLabel = nil;
-static FuExportProgressRingView *sExportProgressRing = nil;
-static UIButton *sExportProgressCancelBtn = nil;
-static BOOL sExportCancelled = NO;
+static UILabel *sExportProgressLabel = nil;
 /** 恢复默认批量写参时抑制逐条 slider 事件（对齐 Android，避免 JS 风暴） */
 static BOOL sSuppressBeautyPanelSliderEvents = NO;
 static dispatch_queue_t gProcessImageQueue;
@@ -670,7 +259,6 @@ static dispatch_queue_t FuProcessImageQueue(void) {
     return gProcessImageQueue;
 }
 static CGFloat sLastBeautyPanelHeight = 0;
-static BOOL sChromeInsetDidInitial = NO;
 static UIWindow *sOverlayWindow = nil;
 static UIWindow *sConfirmWindow = nil;
 static __weak UIWindow *sConfirmPrevKeyWindow = nil;
@@ -681,6 +269,10 @@ static __weak NamaModule *sNamaModuleWeak = nil;
 static void (^sPendingConfirmFinish)(BOOL) = nil;
 static NSString *sLastVideoPath = nil;
 static int sOverlayBringGen = 0;
+/** 取消 mountVideoOverlay 延迟 bringVideoOverlayToFront；返回 import 时递增 */
+static int sVideoOverlayBringGen = 0;
+/** 用户已离开视频页：禁止 bringVideoOverlayToFront / ensureOverlayWindow 再露出叠层 */
+static BOOL sVideoOverlaySuppressed = NO;
 static int sLastCssX = -1;
 static int sLastCssY = -1;
 static int sLastCssW = -1;
@@ -691,7 +283,7 @@ static BOOL sHasStableOverlayBox = NO;
 
 @implementation NamaModule (HostedCamera)
 
-+ (void)attachHostedCameraView:(BeautyCameraView *)view {
++ (void)attachHostedCameraView:(FURenderKitCameraView *)view {
     if (!view) {
         return;
     }
@@ -705,7 +297,7 @@ static BOOL sHasStableOverlayBox = NO;
     FU_LOG("attachHostedCameraView");
 }
 
-+ (void)detachHostedCameraView:(BeautyCameraView *)view {
++ (void)detachHostedCameraView:(FURenderKitCameraView *)view {
     if (!view) {
         return;
     }
@@ -718,80 +310,178 @@ static BOOL sHasStableOverlayBox = NO;
 
 @end
 
-static void FuEnableFaceAlgorithmModules(void) {
-    fuSetMachineType(FUAIMACHINE_HIGH);
-    fuSetDynamicQualityControl(false);
-    fuSetFaceAlgorithmConfig(FUAIFACE_ENABLE_ALL);
-    fuSetARMeshV2(true);
-    FU_LOG("FuEnableFaceAlgorithmModules config=ENABLE_ALL armeshV2=1");
-}
-
 @implementation NamaModule {
     int _beautyHandle;
     int _frameId;
     UniModuleKeepAliveCallback _pickMediaCallback;
 }
 
-//  让NamaModule 能收 UIImagePicker 回调（对齐FULiveDemo 系统相册白底+取消）
+//  让NamaModule 能收 UIImagePicker/PHPicker 回调（对齐FULiveDemo 系统相册白底+取消）
 - (void)imagePickerController:(UIImagePickerController *)picker
 didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
+    [picker dismissViewControllerAnimated:YES completion:nil];
     UniModuleKeepAliveCallback cb = _pickMediaCallback;
     _pickMediaCallback = nil;
-    NSDictionary *infoCopy = [info copy];
-    // 先关相册再后台落盘：主线程同步 JPEG/拷视频会卡死选完后的跳转
-    [picker dismissViewControllerAnimated:YES completion:^{
-        if (!cb) {
+    if (!cb) {
+        return;
+    }
+    NSString *mediaType = info[UIImagePickerControllerMediaType];
+    if ([mediaType isEqualToString:(NSString *)kUTTypeImage]) {
+        UIImage *image = info[UIImagePickerControllerOriginalImage];
+        if (![image isKindOfClass:[UIImage class]]) {
+            cb(@{ @"code": @(-1), @"message": @"未选择图片" }, NO);
             return;
         }
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            NSString *mediaType = infoCopy[UIImagePickerControllerMediaType];
-            if ([mediaType isEqualToString:(NSString *)kUTTypeImage]) {
-                UIImage *image = infoCopy[UIImagePickerControllerOriginalImage];
-                if (![image isKindOfClass:[UIImage class]]) {
+        NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                          [NSString stringWithFormat:@"nama_pick_%@.jpg", @((long long)(NSDate.date.timeIntervalSince1970 * 1000))]];
+        NSData *data = UIImageJPEGRepresentation(image, 0.95);
+        if (!data || ![data writeToFile:path atomically:YES]) {
+            cb(@{ @"code": @(-1), @"message": @"保存图片失败" }, NO);
+            return;
+        }
+        cb(@{ @"code": @(0), @"data": @{ @"path": path, @"type": @"image" } }, NO);
+        return;
+    }
+    // 视频：优先MediaURL，再兜底拷贝
+    NSURL *mediaURL = info[UIImagePickerControllerMediaURL];
+    if ([mediaURL isKindOfClass:[NSURL class]] && mediaURL.isFileURL) {
+        NSString *ext = mediaURL.pathExtension.length > 0 ? mediaURL.pathExtension : @"mp4";
+        NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                          [NSString stringWithFormat:@"nama_pick_%@.%@", @((long long)(NSDate.date.timeIntervalSince1970 * 1000)), ext]];
+        NSError *err = nil;
+        [[NSFileManager defaultManager] removeItemAtPath:dest error:nil];
+        if ([[NSFileManager defaultManager] copyItemAtURL:mediaURL toURL:[NSURL fileURLWithPath:dest] error:&err]) {
+            cb(@{ @"code": @(0), @"data": @{ @"path": dest, @"type": @"video" } }, NO);
+            return;
+        }
+        //  拷贝失败则直接用原路径
+        cb(@{ @"code": @(0), @"data": @{ @"path": mediaURL.path ?: @"", @"type": @"video" } }, NO);
+        return;
+    }
+    cb(@{ @"code": @(-1), @"message": @"未选择视频" }, NO);
+}
+
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    UniModuleKeepAliveCallback cb = _pickMediaCallback;
+    _pickMediaCallback = nil;
+    if (!cb) {
+        return;
+    }
+    PHPickerResult *result = results.firstObject;
+    if (![result isKindOfClass:[PHPickerResult class]]) {
+        cb(@{ @"code": @(-1), @"message": @"用户取消选择" }, NO);
+        return;
+    }
+    NSItemProvider *provider = result.itemProvider;
+    if (!provider) {
+        cb(@{ @"code": @(-1), @"message": @"未选择媒体" }, NO);
+        return;
+    }
+    if ([provider hasItemConformingToTypeIdentifier:(NSString *)kUTTypeImage]) {
+        if ([provider canLoadObjectOfClass:[UIImage class]]) {
+            // 图片：异步取 UIImage，回主线程 JPEG 存临时目录
+            __weak typeof(self) weakSelf = self;
+            [provider loadObjectOfClass:[UIImage class] completionHandler:^(id<NSItemProviderReading> object, NSError *error) {
+                __strong typeof(weakSelf) self = weakSelf;
+                if (!self || !cb) {
+                    return;
+                }
+                if (error || !object) {
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        cb(@{ @"code": @(-1), @"message": @"未选择图片" }, NO);
+                        cb(@{ @"code": @(-1), @"message": error ? (error.localizedDescription ?: @"加载图片失败") : @"未选择图片" }, NO);
                     });
                     return;
                 }
-                NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                                  [NSString stringWithFormat:@"nama_pick_%@.jpg", @((long long)(NSDate.date.timeIntervalSince1970 * 1000))]];
-                NSData *data = UIImageJPEGRepresentation(image, 0.92);
-                BOOL ok = data != nil && [data writeToFile:path atomically:YES];
+                UIImage *image = (UIImage *)object;
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    if (!ok) {
+                    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                                      [NSString stringWithFormat:@"nama_pick_%@.jpg", @((long long)(NSDate.date.timeIntervalSince1970 * 1000))]];
+                    NSData *data = UIImageJPEGRepresentation(image, 0.95);
+                    if (!data || ![data writeToFile:path atomically:YES]) {
                         cb(@{ @"code": @(-1), @"message": @"保存图片失败" }, NO);
                         return;
                     }
                     cb(@{ @"code": @(0), @"data": @{ @"path": path, @"type": @"image" } }, NO);
                 });
-                return;
-            }
-            // 视频仍拷到 App 临时目录，避免相册临时 URL 被系统回收
-            NSURL *mediaURL = infoCopy[UIImagePickerControllerMediaURL];
-            if ([mediaURL isKindOfClass:[NSURL class]] && mediaURL.isFileURL) {
-                NSString *ext = mediaURL.pathExtension.length > 0 ? mediaURL.pathExtension : @"mp4";
-                NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                                  [NSString stringWithFormat:@"nama_pick_%@.%@", @((long long)(NSDate.date.timeIntervalSince1970 * 1000)), ext]];
-                NSError *err = nil;
-                [[NSFileManager defaultManager] removeItemAtPath:dest error:nil];
-                BOOL copied = [[NSFileManager defaultManager] copyItemAtURL:mediaURL
-                                                                      toURL:[NSURL fileURLWithPath:dest]
-                                                                      error:&err];
-                NSString *outPath = copied ? dest : (mediaURL.path ?: @"");
+            }];
+        } else {
+            // 兜底：按 kUTTypeImage 读文件（iCloud 资源可能走此处）
+            [provider loadItemForTypeIdentifier:(NSString *)kUTTypeImage options:nil completionHandler:^(id<NSSecureCoding> item, NSError *error) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    if (outPath.length == 0) {
-                        cb(@{ @"code": @(-1), @"message": err.localizedDescription ?: @"未选择视频" }, NO);
+                    if (error || !item) {
+                        cb(@{ @"code": @(-1), @"message": error ? (error.localizedDescription ?: @"加载图片失败") : @"未选择图片" }, NO);
                         return;
                     }
-                    cb(@{ @"code": @(0), @"data": @{ @"path": outPath, @"type": @"video" } }, NO);
+                    if ([(id)item isKindOfClass:[UIImage class]]) {
+                        NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                                          [NSString stringWithFormat:@"nama_pick_%@.jpg", @((long long)(NSDate.date.timeIntervalSince1970 * 1000))]];
+                        NSData *data = UIImageJPEGRepresentation((UIImage *)item, 0.95);
+                        if (!data || ![data writeToFile:path atomically:YES]) {
+                            cb(@{ @"code": @(-1), @"message": @"保存图片失败" }, NO);
+                            return;
+                        }
+                        cb(@{ @"code": @(0), @"data": @{ @"path": path, @"type": @"image" } }, NO);
+                        return;
+                    }
+                    NSURL *imageURL = [(id)item isKindOfClass:[NSURL class]] ? (NSURL *)item : nil;
+                    if (!imageURL.isFileURL) {
+                        imageURL = nil;
+                    }
+                    NSString *src = imageURL.path;
+                    if (src.length == 0) {
+                        cb(@{ @"code": @(-1), @"message": @"未选择图片" }, NO);
+                        return;
+                    }
+                    UIImage *image = [UIImage imageWithContentsOfFile:src];
+                    if (!image) {
+                        cb(@{ @"code": @(-1), @"message": @"无法解码图片" }, NO);
+                        return;
+                    }
+                    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                                      [NSString stringWithFormat:@"nama_pick_%@.jpg", @((long long)(NSDate.date.timeIntervalSince1970 * 1000))]];
+                    NSData *data = UIImageJPEGRepresentation(image, 0.95);
+                    if (!data || ![data writeToFile:path atomically:YES]) {
+                        cb(@{ @"code": @(-1), @"message": @"保存图片失败" }, NO);
+                        return;
+                    }
+                    cb(@{ @"code": @(0), @"data": @{ @"path": path, @"type": @"image" } }, NO);
+                });
+            }];
+        }
+        return;
+    }
+    if ([provider hasItemConformingToTypeIdentifier:(NSString *)kUTTypeMovie]) {
+        // 视频：loadFileRepresentation 等文件完全 materialize 后再回调；并在 completion 作用域内
+        // 同步拷贝。loadItemForTypeIdentifier 对 iCloud/待转码资源返回的 URL 可能仍是 0 字节占位，
+        // 异步主线程拷贝会得到空文件 → AVURLAsset 无视频轨 → 预览黑屏且无错误提示。
+        [provider loadFileRepresentationForTypeIdentifier:(NSString *)kUTTypeMovie completionHandler:^(NSURL *fileURL, NSError *error) {
+            BOOL urlOk = [fileURL isKindOfClass:[NSURL class]] && fileURL.isFileURL;
+            if (error || !urlOk) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    cb(@{ @"code": @(-1), @"message": error ? (error.localizedDescription ?: @"加载视频失败") : @"未选择视频" }, NO);
                 });
                 return;
             }
+            NSString *ext = fileURL.pathExtension.length > 0 ? fileURL.pathExtension : @"mp4";
+            NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                              [NSString stringWithFormat:@"nama_pick_%@.%@", @((long long)(NSDate.date.timeIntervalSince1970 * 1000)), ext]];
+            NSError *copyErr = nil;
+            [[NSFileManager defaultManager] removeItemAtPath:dest error:nil];
+            BOOL copied = [[NSFileManager defaultManager] copyItemAtURL:fileURL toURL:[NSURL fileURLWithPath:dest] error:&copyErr];
+            NSDictionary *attrs = copied ? [[NSFileManager defaultManager] attributesOfItemAtPath:dest error:nil] : nil;
+            long long size = [(NSNumber *)attrs[NSFileSize] longLongValue];
             dispatch_async(dispatch_get_main_queue(), ^{
-                cb(@{ @"code": @(-1), @"message": @"未选择视频" }, NO);
+                if (!copied || size <= 0) {
+                    cb(@{ @"code": @(-1), @"message": @"视频读取失败（文件为空），请重试" }, NO);
+                    return;
+                }
+                cb(@{ @"code": @(0), @"data": @{ @"path": dest, @"type": @"video" } }, NO);
             });
-        });
-    }];
+        }];
+        return;
+    }
+    cb(@{ @"code": @(-1), @"message": @"未选择媒体" }, NO);
 }
 
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
@@ -804,7 +494,10 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *
 }
 
 /**
- * 对齐 FULiveDemo FUMediaPickerViewController： * UIImagePickerController + SavedPhotosAlbum →系统白底相册，左上角「取消」。 */
+ * 对齐 FULiveDemo FUMediaPickerViewController：
+ * - iOS 14+ 用 PHPickerViewController（异步加载、打开更快、无需相册权限）
+ * - iOS 13 及以下回退 UIImagePickerController + SavedPhotosAlbum →系统白底相册，左上角「取消」
+ */
 UNI_EXPORT_METHOD(@selector(pickMediaFromAlbum:callback:))
 - (void)pickMediaFromAlbum:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     if (callback) {
@@ -823,6 +516,33 @@ UNI_EXPORT_METHOD(@selector(pickMediaFromAlbum:callback:))
                 return;
             }
             self->_pickMediaCallback = [callback copy];
+
+            if (@available(iOS 14, *)) {
+                // PHPicker：异步加载、打开更快，iOS 14+ 无需相册权限
+                PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
+                config.selectionLimit = 1;
+                config.preferredAssetRepresentationMode = PHPickerConfigurationAssetRepresentationModeCompatible;
+                if (wantVideo) {
+                    config.filter = [PHPickerFilter videosFilter];
+                } else {
+                    config.filter = [PHPickerFilter imagesFilter];
+                }
+                PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:config];
+                picker.delegate = (id<PHPickerViewControllerDelegate>)self;
+                picker.modalPresentationStyle = UIModalPresentationFullScreen;
+                UIViewController *host = [self fuTopViewController];
+                if (!host) {
+                    self->_pickMediaCallback = nil;
+                    if (callback) {
+                        callback(@{ @"code": @(-1), @"message": @"无法打开相册" }, NO);
+                    }
+                    return;
+                }
+                [host presentViewController:picker animated:YES completion:nil];
+                return;
+            }
+
+            // iOS 13 及以下回退 UIImagePickerController
             UIImagePickerController *picker = [[UIImagePickerController alloc] init];
             picker.delegate = (id<UINavigationControllerDelegate, UIImagePickerControllerDelegate>)self;
             picker.sourceType = UIImagePickerControllerSourceTypeSavedPhotosAlbum;
@@ -842,6 +562,7 @@ UNI_EXPORT_METHOD(@selector(pickMediaFromAlbum:callback:))
             [host presentViewController:picker animated:YES completion:nil];
         };
 
+        // PHPicker 在 iOS 14+ 无需相册权限；权限检查仅为兼容 iOS 13 及以下
         PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatus];
         if (@available(iOS 14, *)) {
             status = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
@@ -894,9 +615,61 @@ UNI_EXPORT_METHOD(@selector(pickMediaFromAlbum:callback:))
     [self firePreviewChromeEvent:@"captureDown" extra:nil];
 }
 - (void)previewChromeCaptureLongPress {
-    [self firePreviewChromeEvent:@"captureLongPress" extra:nil];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BOOL started = NO;
+        NSString *errMsg = nil;
+        if (sOverlayCameraView) {
+            NSError *err = nil;
+            started = [sOverlayCameraView startVideoRecord:&err];
+            if (!started) {
+                errMsg = err.localizedDescription ?: @"开始录制失败";
+                [weakSelf presentOverlayToast:errMsg durationMs:1500];
+            } else {
+                if (sPreviewChromeView) {
+                    [sPreviewChromeView syncRecordProgressToNow];
+                }
+                sOverlayCameraView.onAutoStopRecording = ^(NSString *path, NSError *error) {
+                    __strong typeof(weakSelf) self = weakSelf;
+                    if (sPreviewChromeView) {
+                        [sPreviewChromeView setRecording:NO];
+                    }
+                    [self firePreviewChromeEvent:@"recordAutoStopped" extra:@{
+                        @"path": path ?: @"",
+                        @"ok": @(error == nil && path.length > 0),
+                        @"message": error.localizedDescription ?: @"",
+                    }];
+                };
+            }
+        } else {
+            errMsg = @"相机未挂载";
+        }
+        [weakSelf firePreviewChromeEvent:@"captureLongPress" extra:@{
+            @"ok": @(started),
+            @"message": errMsg ?: @"",
+        }];
+    });
 }
 - (void)previewChromeCaptureTouchUp:(BOOL)wasLongPress {
+    if (wasLongPress && sOverlayCameraView) {
+        __weak typeof(self) weakSelf = self;
+        [sOverlayCameraView stopVideoRecord:^(NSString *path, NSError *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (sPreviewChromeView) {
+                    [sPreviewChromeView setRecording:NO];
+                }
+                __strong typeof(weakSelf) self = weakSelf;
+                if (!self) {
+                    return;
+                }
+                [self firePreviewChromeEvent:@"recordStopped" extra:@{
+                    @"path": path ?: @"",
+                    @"ok": @(error == nil && path.length > 0),
+                    @"message": error.localizedDescription ?: @"",
+                }];
+            });
+        }];
+    }
     [self firePreviewChromeEvent:@"captureUp" extra:@{ @"longPress": @(wasLongPress) }];
 }
 - (void)previewChromeCompareStart {
@@ -915,7 +688,32 @@ UNI_EXPORT_METHOD(@selector(pickMediaFromAlbum:callback:))
     [self firePreviewChromeEvent:@"dualInput" extra:@{ @"dual": @(dual) }];
 }
 - (void)previewChromeSelectResolution:(NSString *)resolutionId {
+    FU_LOG("previewChromeSelectResolution id=%@", resolutionId ?: @"");
+    if ([resolutionId isKindOfClass:[NSString class]] && resolutionId.length > 0) {
+        __weak typeof(self) weakSelf = self;
+        [FURenderKitCameraView applyPreviewResolutionId:resolutionId
+                                   unsupportedHandler:^{
+            [weakSelf presentOverlayToast:@"设备不支持该分辨率" durationMs:1500];
+        }
+                                           completion:nil];
+    }
     [self firePreviewChromeEvent:@"resolution" extra:@{ @"id": resolutionId ?: @"" }];
+}
+
+- (NSDictionary *)previewResolutionDimensionsForId:(NSString *)resolutionId {
+    if (![resolutionId isKindOfClass:[NSString class]] || resolutionId.length == 0) {
+        return nil;
+    }
+    if ([resolutionId isEqualToString:@"480"]) {
+        return @{ @"width": @(640), @"height": @(480) };
+    }
+    if ([resolutionId isEqualToString:@"720"]) {
+        return @{ @"width": @(1280), @"height": @(720) };
+    }
+    if ([resolutionId isEqualToString:@"1080"]) {
+        return @{ @"width": @(1920), @"height": @(1080) };
+    }
+    return nil;
 }
 - (void)previewChromeImportMedia {
     [self firePreviewChromeEvent:@"importMedia" extra:nil];
@@ -1028,16 +826,9 @@ UNI_EXPORT_METHOD(@selector(showPreviewChrome:callback:))
                 callback(@{ @"code": @(-1), @"message": @"PreviewChromeView missing" }, NO);
                 return;
             }
-            // 直接用目标 frame 创建，避免 CGRectZero 首帧把拍摄钮画在左上角再跳位
-            CGRect box = [self previewBoxFrameOnDecor:x y:y width:width height:height];
-            sPreviewChromeView = [[chromeCls alloc] initWithFrame:box];
+            sPreviewChromeView = [[chromeCls alloc] initWithFrame:CGRectZero];
             sPreviewChromeView.delegate = (id<PreviewChromeViewDelegate>)self;
             [parent addSubview:sPreviewChromeView];
-            [UIView performWithoutAnimation:^{
-                [sPreviewChromeView setBottomChromeInset:sLastBeautyPanelHeight animated:NO];
-                [sPreviewChromeView setCompareButtonHidden:sLastBeautyPanelHeight > 0.5];
-                [sPreviewChromeView layoutIfNeeded];
-            }];
         } else if (sPreviewChromeView.superview != parent) {
             [sPreviewChromeView removeFromSuperview];
             [parent addSubview:sPreviewChromeView];
@@ -1100,20 +891,14 @@ UNI_EXPORT_METHOD(@selector(hidePreviewChrome:))
     });
 }
 
-- (void)applyBeautyPanelBottomInset:(CGFloat)panelHeight animated:(BOOL)animated {
+- (void)applyBeautyPanelBottomInset:(CGFloat)panelHeight {
     // 面板高度整段抬升拍摄钮；PreviewChrome 再留 panelGap，避免被 Tab 盖住
     sLastBeautyPanelHeight = MAX(0, panelHeight);
     CGFloat inset = sLastBeautyPanelHeight;
     if (sPreviewChromeView) {
-        [sPreviewChromeView setBottomChromeInset:inset animated:animated];
-        [sPreviewChromeView setCompareButtonHidden:inset > 0.5];
+        [sPreviewChromeView setBottomChromeInset:inset animated:YES];
+        [sPreviewChromeView setCompareButtonHidden:YES];
     }
-}
-
-- (void)applyBeautyPanelBottomInset:(CGFloat)panelHeight {
-    // 拍摄钮位置始终瞬切，避免进入美颜页时从错误位置滑入
-    sChromeInsetDidInitial = YES;
-    [self applyBeautyPanelBottomInset:panelHeight animated:NO];
 }
 
 - (UIView *)resolveBeautyPanelParentForMode:(NSString *)mode {
@@ -1253,10 +1038,7 @@ UNI_EXPORT_METHOD(@selector(showBeautyPanel:callback:))
             [parent addSubview:sBeautyPanelView];
         }
         sBeautyPanelView.hidden = NO;
-        NSMutableDictionary *cfgMut = [NSMutableDictionary dictionaryWithDictionary:cfg];
-        // 始终以 SDK fuGetDeviceLevel 为准，避免 JS 默认 1 或过早查询导致高档机灰显
-        cfgMut[@"devicePerfLevel"] = @(FuClampedDevicePerformanceLevel());
-        [sBeautyPanelView applyConfig:cfgMut];
+        [sBeautyPanelView applyConfig:cfg];
         [self syncBeautyPanelLayout];
         BOOL media = [mode isEqualToString:@"image"] || [mode isEqualToString:@"video"];
         if (media) {
@@ -1281,11 +1063,10 @@ UNI_EXPORT_METHOD(@selector(hideBeautyPanel:))
             sBeautyPanelView = nil;
         }
         if (sPreviewChromeView) {
-            [sPreviewChromeView setBottomChromeInset:0 animated:NO];
+            [sPreviewChromeView setBottomChromeInset:0 animated:YES];
             [sPreviewChromeView setCompareButtonHidden:NO];
         }
         sLastBeautyPanelHeight = 0;
-        sChromeInsetDidInitial = NO;
         if (callback) {
             callback(@{ @"code": @(0), @"data": @(0) }, NO);
         }
@@ -1393,8 +1174,7 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
 }
 
 - (void)beautyPanelDidChangeHeight:(CGFloat)heightPts {
-    // 进入/切 Tab 时勿动画抬升拍摄钮，否则会从底部或左上角滑到目标位
-    [self applyBeautyPanelBottomInset:heightPts animated:NO];
+    [self applyBeautyPanelBottomInset:heightPts];
     [self fireBeautyPanelEvent:@"panelHeight" extra:@{ @"height": @(heightPts) }];
 }
 - (void)beautyPanelSelectTab:(NSString *)tabId expanded:(BOOL)expanded {
@@ -1407,20 +1187,23 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
     int handle = [self resolvePanelBeautyHandle];
     if (handle > 0 && key.length > 0) {
         NSString *sdkKey = FuResolveBeautyParamKey(key);
+        if (!FuBeautyParamAllowedOnDevice(sdkKey)) {
+            return;
+        }
         BOOL special = [sdkKey isEqualToString:@"body_blur_level"] ||
             [sdkKey isEqualToString:@"delspot_level"] ||
             [sdkKey isEqualToString:@"facial_plump"] ||
             [sdkKey isEqualToString:@"intensity_eye_pupil"] ||
             [sdkKey isEqualToString:@"enable_skinseg"];
         if (special) {
-            // 只入队 + cache，由渲染线程 flush/reconfirm 写参（主线程抢 GL 会偶现写不上）
-            [BeautyCameraView enqueueBeautyParam:handle name:sdkKey value:value];
+            // 对齐 Android applySpecialAlgoParam：单 key 入队，flush 时走 special 写参
+            [FURenderKitCameraView enqueueBeautyParam:handle name:sdkKey value:value];
             if ([sdkKey isEqualToString:@"body_blur_level"]) {
                 FuResetBeautyBlurCache();
             }
         } else {
             // 与 special 一样进渲染队列，避免主线程 set 后渲染线程读到旧值
-            [BeautyCameraView enqueueBeautyParam:handle name:sdkKey value:value];
+            [FURenderKitCameraView enqueueBeautyParam:handle name:sdkKey value:value];
         }
     }
     [self refreshPausedVideoBeautyIfNeeded];
@@ -1432,7 +1215,7 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
 
 - (void)requestCameraPreviewRedrawIfActive {
     NSString *panelMode = sBeautyPanelView.mode;
-    // 图片页勿触发相机 GL 重绘，会与后台 processImage 并发 fuRender
+    // 图片页勿触发相机 GL 重绘，会与后台 processImage 并发 renderWithInput
     if ([panelMode isEqualToString:@"image"]) {
         return;
     }
@@ -1450,11 +1233,11 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
     FU_LOG("recoverDefaults write handle=%d count=%lu tab=%@", handle, (unsigned long)params.count, tabId ?: @"");
 
     if (handle > 0) {
-        [BeautyCameraView enqueueBeautyParam:handle name:@"change_frames" value:0.0];
-        [BeautyCameraView enqueueBeautyParam:handle name:@"is_beauty_on" value:1.0];
+        [FURenderKitCameraView enqueueBeautyParam:handle name:@"change_frames" value:0.0];
+        [FURenderKitCameraView enqueueBeautyParam:handle name:@"is_beauty_on" value:1.0];
         if (isShape) {
-            [BeautyCameraView enqueueBeautyParam:handle name:@"face_shape" value:4.0];
-            [BeautyCameraView enqueueBeautyParam:handle name:@"face_shape_level" value:1.0];
+            [FURenderKitCameraView enqueueBeautyParam:handle name:@"face_shape" value:4.0];
+            [FURenderKitCameraView enqueueBeautyParam:handle name:@"face_shape_level" value:1.0];
         }
     }
 
@@ -1467,12 +1250,22 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
         [self beautyPanelSliderChanged:key value:num.doubleValue];
     }];
     if (!isShape && handle > 0) {
-        [BeautyCameraView enqueueBeautyParam:handle name:@"enable_skinseg" value:0.0];
+        [FURenderKitCameraView enqueueBeautyParam:handle name:@"enable_skinseg" value:0.0];
     }
     sSuppressBeautyPanelSliderEvents = NO;
 
     [self refreshPausedVideoBeautyIfNeeded];
     [self requestCameraPreviewRedrawIfActive];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (FuBeautyChangeFramesHoldZero()) {
+            return;
+        }
+        int h = [self resolvePanelBeautyHandle];
+        if (h > 0) {
+            [FURenderKitCameraView enqueueBeautyParam:h name:@"change_frames" value:12.0];
+        }
+    });
 }
 
 - (void)beautyPanelDidRecoverDefaults:(NSString *)tabId {
@@ -1483,8 +1276,17 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
 
 - (void)beautyPanelSelectFilter:(NSString *)filterId filterKey:(NSString *)filterKey filterName:(NSString *)filterName {
     int handle = [self resolvePanelBeautyHandle];
+    double level = 0.4;
+    if (sBeautyPanelView) {
+        level = [sBeautyPanelView peekFilterSdkIntensity:filterKey.length ? filterKey : filterId];
+    }
+    if ([filterKey isEqualToString:@"origin"] || [filterId isEqualToString:@"origin"]) {
+        level = 0;
+    }
     if (handle > 0 && filterKey.length > 0) {
-        FuItemSetParamsLogged(handle, "filter_name", filterKey.UTF8String);
+        // 滤镜名走渲染队列 KVC 映射到 FUBeauty.filterName
+        [FURenderKitCameraView enqueueBeautyParamString:handle name:@"filter_name" value:filterKey];
+        [FURenderKitCameraView enqueueBeautyParam:handle name:@"filter_level" value:level];
     }
     [self refreshPausedVideoBeautyIfNeeded];
     NSString *tip = filterName.length ? filterName : filterKey;
@@ -1500,15 +1302,18 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
 - (void)beautyPanelWhiteningMode:(NSString *)mode {
     int handle = [self resolvePanelBeautyHandle];
     double v = [mode isEqualToString:@"skin"] ? 1.0 : 0.0;
+    if (v > 0.5 && !FuBeautyParamAllowedOnDevice(@"enable_skinseg")) {
+        return;
+    }
     if (handle > 0) {
         // 勿在主线程 performWithSharedGLLock，恢复默认时会卡死 UI
-        [BeautyCameraView enqueueBeautyParam:handle name:@"enable_skinseg" value:v];
+        [FURenderKitCameraView enqueueBeautyParam:handle name:@"enable_skinseg" value:v];
     }
     [self refreshPausedVideoBeautyIfNeeded];
     [self fireBeautyPanelEvent:@"whiteningMode" extra:@{ @"mode": mode ?: @"global" }];
 }
 - (void)beautyPanelCompareStart {
-    [BeautyCameraView setBeautyEnabledGlobal:NO];
+    [FURenderKitCameraView setBeautyEnabledGlobal:NO];
     if (sOverlayCameraView) {
         [sOverlayCameraView setBeautyEnabled:NO];
     }
@@ -1519,7 +1324,7 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
     [self fireBeautyPanelEvent:@"compareStart" extra:nil];
 }
 - (void)beautyPanelCompareEnd {
-    [BeautyCameraView setBeautyEnabledGlobal:YES];
+    [FURenderKitCameraView setBeautyEnabledGlobal:YES];
     if (sOverlayCameraView) {
         [sOverlayCameraView setBeautyEnabled:YES];
     }
@@ -1536,167 +1341,129 @@ static NSString *FuResolveBeautyParamKey(NSString *key) {
     [self fireBeautyPanelEvent:@"back" extra:nil];
 }
 
-- (void)beautyPanelShowPerfLimitTip:(NSString *)message {
-    if (message.length == 0) {
-        return;
-    }
-    [self showPreviewPerfLimitTip:message];
-}
-
-- (void)showPreviewPerfLimitTip:(NSString *)message {
-    if (message.length == 0) {
-        return;
-    }
-    // 性能限制提示须盖在美颜面板(z~30100)之上；PreviewChrome 在面板下层会被挡住
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *root = sOverlayVideoHost ?: sOverlayCameraHost ?: [self resolveOverlayParentView] ?: [self resolveBusinessWindow];
-        if (!root) {
-            return;
-        }
-        static const NSInteger kPerfTipTag = 88215603;
-        UIView *old = [root viewWithTag:kPerfTipTag];
-        [old.layer removeAllAnimations];
-        [old removeFromSuperview];
-
-        UILabel *label = [[UILabel alloc] init];
-        label.text = message;
-        label.textColor = [UIColor whiteColor];
-        label.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        label.textAlignment = NSTextAlignmentCenter;
-        label.numberOfLines = 0;
-
-        UIView *card = [[UIView alloc] init];
-        card.tag = kPerfTipTag;
-        card.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
-        card.layer.cornerRadius = 10;
-        card.clipsToBounds = YES;
-        card.layer.zPosition = 50001.f;
-        [card addSubview:label];
-
-        CGFloat maxW = MIN(CGRectGetWidth(root.bounds) - 48.f, 300.f);
-        CGSize textSize = [label sizeThatFits:CGSizeMake(maxW - 28.f, CGFLOAT_MAX)];
-        CGFloat w = MIN(maxW, MAX(160.f, textSize.width + 28.f));
-        CGFloat h = MAX(40.f, textSize.height + 20.f);
-        CGFloat panelH = sLastBeautyPanelHeight > 0 ? sLastBeautyPanelHeight : 80.f;
-        CGFloat tipCenterY = (CGRectGetHeight(root.bounds) - panelH) * 0.42f;
-        card.frame = CGRectMake((CGRectGetWidth(root.bounds) - w) * 0.5f, tipCenterY - h * 0.5f, w, h);
-        label.frame = CGRectMake(14, 10, w - 28.f, h - 20.f);
-        card.alpha = 0;
-        [root addSubview:card];
-        [root bringSubviewToFront:card];
-        [UIView animateWithDuration:0.18 animations:^{
-            card.alpha = 1;
-        } completion:^(__unused BOOL finished) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [UIView animateWithDuration:0.22 animations:^{
-                    card.alpha = 0;
-                } completion:^(__unused BOOL done) {
-                    [card removeFromSuperview];
-                }];
-            });
-        }];
-    });
-}
-
 #pragma mark - SDK
 
 UNI_EXPORT_METHOD(@selector(getVersion:))
 - (void)getVersion:(UniModuleKeepAliveCallback)callback {
-    callback(@{ @"code": @(0), @"data": [NSString stringWithUTF8String:fuGetVersion()] }, NO);
+    callback(@{ @"code": @(0), @"data": [FURenderKit getVersion] ?: @"" }, NO);
 }
 
 UNI_EXPORT_METHOD(@selector(init:callback:))
 - (void)init:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    static BOOL sSetupSucceeded = NO;
     NSData *authData = [self readAuthData:options];
     if (authData == nil || authData.length == 0) {
         callback(@{ @"code": @(-1), @"message": @"authData 不能为空" }, NO);
         return;
     }
 
-    FuDisableSdkLogging();
-    int setupCode = fuSetup(NULL, 0, NULL, (void *)authData.bytes, (int)authData.length);
-    int libInit = fuIsLibraryInit();
-    int systemError = fuGetSystemError();
-    NSString *version = [NSString stringWithUTF8String:fuGetVersion()];
+    @try {
+        // FURenderKit 是全局单例，setup 只能成功一次；重复调用会返回 NO。
+        // 首次成功后记录标记，后续 init（如鉴权验证重复点击）直接返回成功。
+        if (sSetupSucceeded) {
+            callback(@{ @"code": @(0), @"data": @{ @"reused": @(1), @"version": [FURenderKit getVersion] ?: @"" } }, NO);
+            return;
+        }
+        FUSetupConfig *config = [[FUSetupConfig alloc] init];
+        config.authPack = FUAuthPackMake((char *)authData.bytes, (int)authData.length);
+        // controller_cpp.bundle 已随插件内置，setup 阶段必须提供
+        NSString *controllerPath = [self furKitBundlePathForResource:@"controller_cpp" ofType:@"bundle"];
+        if (controllerPath.length > 0) {
+            config.controllerPath = controllerPath;
+        }
+        [FURenderKit setLogLevel:FU_LOG_LEVEL_ERROR];
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        BOOL ok = [FURenderKit setupWithSetupConfig:config];
+        CFAbsoluteTime t1 = CFAbsoluteTimeGetCurrent();
+        // 对齐官方 FURenderKitManager：设置缓存目录，提升模型/资源加载速度
+        if (ok) {
+            NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+            NSString *docPath = paths.count > 0 ? paths[0] : nil;
+            if (docPath.length > 0) {
+                [FURenderKit setCacheDirectory:docPath];
+            }
+        }
+        NSString *version = [FURenderKit getVersion];
+        int sysErr = [FURenderKit getSystemError];
+        NSString *sysErrStr = [FURenderKit getSystemErrorString];
 
-    NSMutableDictionary *diag = [@{
-        @"version": version ?: @"",
-        @"authSize": @(authData.length),
-        @"fuSetupCode": @(setupCode),
-        @"fuIsLibraryInit": @(libInit),
-        @"fuGetSystemError": @(systemError),
-    } mutableCopy];
+        NSMutableDictionary *diag = [@{
+            @"version": version ?: @"",
+            @"authSize": @(authData.length),
+            @"controllerPath": controllerPath ?: @"",
+            @"fuSetupCode": @(ok ? 1 : 0),
+            @"fuIsLibraryInit": @(ok ? 1 : 0),
+            @"furKitSetup": @(ok ? 1 : 0),
+            @"sysError": @(sysErr),
+            @"sysErrorString": sysErrStr ?: @"",
+        } mutableCopy];
 
-    if (systemError != 0) {
-        diag[@"fuGetSystemErrorString"] = [NSString stringWithUTF8String:fuGetSystemErrorString(systemError)] ?: @"";
-    }
-    if (setupCode == 0) {
-        callback(@{ @"code": @(-1), @"message": @"fuSetup 失败 code=0", @"data": diag }, NO);
-        return;
-    }
-    if (libInit == 0) {
-        callback(@{
-            @"code": @(-1),
-            @"message": @"SDK 未就绪fuIsLibraryInit=0（authpack 与Bundle ID 不匹配）",
-            @"data": diag
-        }, NO);
-        return;
-    }
+        // 文件日志：写沙盒 Documents/nama_diag.log，便于离线打包导出诊断
+        [self appendDiagFile:[NSString stringWithFormat:
+            @"init ok=%d version=%@ authSize=%lu controllerPath=%@ sysError=%d %@ setupMs=%.0f",
+            ok ? 1 : 0, version ?: @"?", (unsigned long)authData.length,
+            controllerPath ?: @"<空>", sysErr, sysErrStr ?: @"", (t1 - t0) * 1000]];
 
-    callback(@{ @"code": @(0), @"data": diag }, NO);
+        if (!ok) {
+            callback(@{
+                @"code": @(-1),
+                @"message": [NSString stringWithFormat:@"FURenderKit setup 失败 (sysError=%d %@)", sysErr, sysErrStr ?: @""],
+                @"data": diag
+            }, NO);
+            return;
+        }
+        sSetupSucceeded = YES;
+        callback(@{ @"code": @(0), @"data": diag }, NO);
+    } @catch (NSException *exception) {
+        callback(@{ @"code": @(-1), @"message": exception.reason ?: @"init 异常" }, NO);
+    }
 }
 
 UNI_EXPORT_METHOD(@selector(loadAIModel:callback:))
 - (void)loadAIModel:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     @try {
         [self ensureInitialized];
-        NSData *bundleData = [self readFileData:options[@"path"]];
-        int aiType = [options[@"aiType"] intValue];
-        if (aiType == 0) {
-            aiType = FUAITYPE_FACEPROCESSOR;
-        }
-        // load 前开子模块：默认 algorithmConfig=-1 会全关皮肤分割祛斑/ARMeshV2/丰盈
-        // release 后再设一次，避免 release 把config 打回默认 -1
-        FuEnableFaceAlgorithmModules();
-        if (fuIsAIModelLoaded(FUAITYPE_FACEPROCESSOR)) {
-            fuReleaseAIModel(FUAITYPE_FACEPROCESSOR);
-        }
-        FuEnableFaceAlgorithmModules();
-        int handle = fuLoadAIModelFromPackage((void *)bundleData.bytes, (int)bundleData.length, aiType);
-        if (handle <= 0) {
-            callback(@{ @"code": @(-1), @"message": @"loadAIModel 失败" }, NO);
+        // iOS 改用插件内置 bundle，不再依赖 JS 传 path（OSS 下载）
+        NSString *aiPath = [self furKitBundlePathForResource:@"ai_face_processor" ofType:@"bundle"];
+        if (aiPath.length == 0) {
+            callback(@{ @"code": @(-1), @"message": @"内置 ai_face_processor.bundle 缺失" }, NO);
             return;
         }
-        // load 后再开公开侧开关（ARMesh / algorithm config）；勿调未公开 FUAI_SetUse*
-        FuEnableAdvancedBeautyRuntime(0);
-        FuRefreshDevicePerformanceLevelFromSdk();
-        int perf = FuClampedDevicePerformanceLevel();
-        if (perf < 1 || perf > 4) {
-            perf = 1;
+        FUDevicePerformanceLevel perf = [FURenderKit devicePerformanceLevel];
+        // 按机型性能分级开算法子模块（对齐官方 FURenderKitManager.loadFaceAIModel）
+        FUFaceAlgorithmConfig config = FUFaceAlgorithmConfigEnableAll;
+        if (perf < FUDevicePerformanceLevelHigh) {
+            config = FUFaceAlgorithmConfigDisableAll;
+        } else if (perf < FUDevicePerformanceLevelVeryHigh) {
+            config = FUFaceAlgorithmConfigDisableSkinSegAndDelSpot |
+                FUFaceAlgorithmConfigDisableARMeshV2 |
+                FUFaceAlgorithmConfigDisableRACE;
+        } else if (perf < FUDevicePerformanceLevelExcellent) {
+            config = FUFaceAlgorithmConfigDisableSkinSeg;
         }
-        // 默认识别 4 人（对齐 Android NamaSdkManager.configureFaceProcessor）
-        fuSetMaxFaces(4);
-        (void)perf;
-        fuSetFaceProcessorDetectMode(1);
-        fuFaceProcessorSetMinFaceRatio(0.05f);
-        int faceOk = fuIsAIModelLoaded(FUAITYPE_FACEPROCESSOR);
-        int m0 = fuGetModuleCode(0), m1 = fuGetModuleCode(1), m2 = fuGetModuleCode(2), m3 = fuGetModuleCode(3);
-        FU_LOG("loadAIModel ok handle=%d aiBytes=%lu faceLoaded=%d ARMeshV2=1 algo=0 machine=HIGH dq=0 module=[%d,%d,%d,%d]",
-               handle,
-               (unsigned long)bundleData.length,
-               faceOk,
-               m0, m1, m2, m3);
+        [FUAIKit setFaceAlgorithmConfig:config];
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        [FUAIKit loadAIModeWithAIType:FUAITYPE_FACEPROCESSOR dataPath:aiPath];
+        CFAbsoluteTime t1 = CFAbsoluteTimeGetCurrent();
+        // 对齐官方 FURenderKitManager.setDevicePerformanceDetails：点位质量/小脸检测/最大脸数
+        FUAIKit *ai = [FUAIKit shareKit];
+        ai.faceProcessorFaceLandmarkQuality = perf >= FUDevicePerformanceLevelHigh
+            ? FUFaceProcessorFaceLandmarkQualityHigh : FUFaceProcessorFaceLandmarkQualityMedium;
+        ai.faceProcessorSetFaceLandmarkHpOccu = NO;
+        ai.faceProcessorDetectSmallFace = perf >= FUDevicePerformanceLevelHigh;
+        ai.maxTrackFaces = perf >= FUDevicePerformanceLevelHigh ? 4 : 2;
+        BOOL faceLoaded = [FUAIKit shareKit].trackedFacesCount >= 0;
+        NSString *version = [FURenderKit getVersion];
+        [self appendDiagFile:[NSString stringWithFormat:
+            @"loadAIModel faceLoaded=%d loadMs=%.0f aiPath=%@",
+            faceLoaded ? 1 : 0, (t1 - t0) * 1000, aiPath ?: @""]];
         callback(@{
             @"code": @(0),
             @"data": @{
-                @"handle": @(handle),
-                @"aiBytes": @((unsigned long)bundleData.length),
-                @"faceLoaded": @(faceOk),
-                @"moduleCode0": @(m0),
-                @"moduleCode1": @(m1),
-                @"moduleCode2": @(m2),
-                @"moduleCode3": @(m3),
-                @"deviceLevel": @(perf),
+                @"handle": @(1),
+                @"faceLoaded": @(faceLoaded),
+                @"aiPath": aiPath ?: @"",
+                @"perfLevel": @(perf),
             },
         }, NO);
     } @catch (NSException *exception) {
@@ -1708,46 +1475,60 @@ UNI_EXPORT_METHOD(@selector(loadBundle:callback:))
 - (void)loadBundle:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     @try {
         [self ensureInitialized];
-        NSData *bundleData = [self readFileData:options[@"path"]];
         NSString *pipeline = options[@"pipeline"];
         BOOL media = [pipeline isKindOfClass:[NSString class]] &&
             [pipeline caseInsensitiveCompare:@"media"] == NSOrderedSame;
-        int old = media ? FuBeautyMediaHandle : FuBeautyCameraHandle;
-        if (old > 0) {
-            fuDestroyItem(old);
-        }
-        int handle = fuCreateItemFromPackage((void *)bundleData.bytes, (int)bundleData.length);
-        if (handle <= 0) {
-            callback(@{ @"code": @(-1), @"message": @"loadBundle 失败" }, NO);
+        // iOS 只用一套 FUBeauty（挂在 FURenderKit 单例），camera/media 共用同一对象。
+        // Android Kit 用独立 handle；iOS 这里统一返回非零 handle 即可满足 JS 的 parseNativeHandle。
+        NSString *beautyPath = [self furKitBundlePathForResource:@"face_beautification" ofType:@"bundle"];
+        if (beautyPath.length == 0) {
+            callback(@{ @"code": @(-1), @"message": @"内置 face_beautification.bundle 缺失" }, NO);
             return;
         }
-        FuBeautySetPipelineHandle(media, handle);
-        // 兼容旧逻辑：_beautyHandle 记「当前管线」最后一次load
-        _beautyHandle = handle;
-        FuEnableAdvancedBeautyRuntime(handle);
-        FuItemSetParamdLogged(handle, "is_beauty_on", 1.0);
-        // 强度默认必须对齐 beauty-effects.ts（全身磨皮/祛斑默认 0；勿写 3.3/0.5，否则常驻闪点）
-        FuItemSetParamdLogged(handle, "skin_detect", 0.0);
-        FuItemSetParamdLogged(handle, "blur_level", 3.3);
-        FuItemSetParamdLogged(handle, "color_level", 0.4);
-        FuItemSetParamdLogged(handle, "red_level", 0.3);
-        FuItemSetParamdLogged(handle, "face_shape", 4.0);
-        FuItemSetParamdLogged(handle, "face_shape_level", 1.0);
-        FuItemSetParamdLogged(handle, "body_blur_level", 0.0);
-        FuItemSetParamdLogged(handle, "delspot_level", 0.0);
-        FuItemSetParamdLogged(handle, "facial_plump", 0.0);
-        FuItemSetParamdLogged(handle, "intensity_eye_pupil", 0.5);
-        FuItemSetParamdLogged(handle, "disable_delspot", 0.0);
-        FuResetBeautyBlurCache();
-        FuUpdateBeautyBlurEffect(handle);
-        FU_LOG("loadBundle pipeline=%@ handle=%d camera=%d media=%d",
-               media ? @"media" : @"camera",
-               handle,
-               FuBeautyCameraHandle,
-               FuBeautyMediaHandle);
-        if (!media) {
-            [BeautyCameraView setBeautyEnabledGlobal:YES];
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        FUBeauty *beauty = [[FUBeauty alloc] initWithPath:beautyPath name:@"FUBeauty"];
+        CFAbsoluteTime t1 = CFAbsoluteTimeGetCurrent();
+        if (!beauty) {
+            callback(@{ @"code": @(-1), @"message": @"FUBeauty 创建失败" }, NO);
+            return;
         }
+        [self appendDiagFile:[NSString stringWithFormat:
+            @"loadBundle createMs=%.0f pipeline=%@", (t1 - t0) * 1000, media ? @"media" : @"camera"]];
+        // 对齐官方 FUStyleListViewModel：美型/美肤参数需先设置 mode 才生效（否则写属性无效）
+        FUDevicePerformanceLevel perfLevel = [FURenderKit devicePerformanceLevel];
+        if (perfLevel >= FUDevicePerformanceLevelHigh) {
+            [beauty addPropertyMode:FUBeautyPropertyMode2 forKey:FUModeKeyRemovePouchStrength];
+            [beauty addPropertyMode:FUBeautyPropertyMode2 forKey:FUModeKeyRemoveNasolabialFoldsStrength];
+            [beauty addPropertyMode:FUBeautyPropertyMode3 forKey:FUModeKeyEyeEnlarging];
+            [beauty addPropertyMode:FUBeautyPropertyMode3 forKey:FUModeKeyIntensityMouth];
+        }
+        // 美白推荐用 Mode2（官方文档 v8.2.0+），JS 侧传 color_level_mode2
+        [beauty addPropertyMode:FUBeautyPropertyMode2 forKey:FUModeKeyColorLevel];
+        [FURenderKit shareRenderKit].beauty = beauty;
+        // 强度默认对齐 beauty-effects.ts（勿写 3.3/0.5，否则常驻闪点）
+        beauty.skinDetect = 0;
+        beauty.blurLevel = 3.3;
+        beauty.colorLevel = 0.4;
+        beauty.redLevel = 0.3;
+        beauty.faceShape = 4;
+        beauty.faceShapeLevel = 1.0;
+        beauty.blurType = 3;
+        beauty.blurUseMask = YES;
+        beauty.enableWarpAntiAlias = YES;
+        beauty.enable = YES;
+        // 非零 handle 占位，满足 JS parseNativeHandle > 0 判断
+        int handle = 1;
+        FuBeautyCameraHandle = handle;
+        if (media) {
+            FuBeautyMediaHandle = handle;
+        } else {
+            FuBeautyItemHandle = handle;
+        }
+        _beautyHandle = handle;
+        if (!media) {
+            [FURenderKitCameraView setBeautyEnabledGlobal:YES];
+        }
+        FU_LOG("loadBundle pipeline=%@ beauty created handle=%d", media ? @"media" : @"camera", handle);
         callback(@{
             @"code": @(0),
             @"data": @{
@@ -1779,44 +1560,62 @@ UNI_EXPORT_METHOD(@selector(setParam:callback:))
             return;
         }
         NSString *key = options[@"key"];
-        int ret;
         NSString *stringValue = options[@"stringValue"];
-        if (stringValue.length > 0) {
-            ret = FuItemSetParamsLogged(handle, key.UTF8String, stringValue.UTF8String);
-            callback(@{ @"code": @(0), @"data": @{ @"ret": @(ret) } }, NO);
+        NSString *resolvedKey = FuResolveBeautyParamKey(key);
+        if (!FuBeautyParamAllowedOnDevice(resolvedKey)) {
+            callback(@{ @"code": @(0), @"data": @{ @"ret": @(-1) } }, NO);
             return;
         }
-        double value = [options[@"value"] doubleValue];
-        NSString *sdkKey = FuResolveBeautyParamKey(key);
-        // 依赖 AI 子模块的参数：须在Nama GL 线程写，否则可能 get=set 但渲染无效果
-        BOOL special = [sdkKey isEqualToString:@"body_blur_level"] ||
-            [sdkKey isEqualToString:@"delspot_level"] ||
-            [sdkKey isEqualToString:@"facial_plump"] ||
-            [sdkKey isEqualToString:@"intensity_eye_pupil"] ||
-            [sdkKey isEqualToString:@"enable_skinseg"];
-        __block int retBlock = 0;
-        NSMutableDictionary *data = [@{
-            @"ret": @(0),
-        } mutableCopy];
-        if (special) {
-            // 只入队 + cache，渲染线程 flush 后生效（对齐 Android queueEvent）
-            [BeautyCameraView enqueueBeautyParam:handle name:sdkKey value:value];
-            if ([sdkKey isEqualToString:@"body_blur_level"]) {
-                FuResetBeautyBlurCache();
-            }
-            retBlock = 0;
+        [self appendDiagFile:[NSString stringWithFormat:
+            @"setParam key=%@ %@ handle=%d", key ?: @"?", stringValue.length > 0 ? [NSString stringWithFormat:@"str=%@", stringValue] : [NSString stringWithFormat:@"v=%.3f", [options[@"value"] doubleValue]], handle]];
+        NSMutableDictionary *data = [@{ @"ret": @(0) } mutableCopy];
+        if (stringValue.length > 0) {
+            [FURenderKitCameraView enqueueBeautyParamString:handle name:key value:stringValue];
         } else {
-            retBlock = FuItemSetParamdLogged(handle, sdkKey.UTF8String, value);
-            if ([sdkKey isEqualToString:@"eye_bright"]) {
-                FuItemSetParamdLogged(handle, "eye_bright_v2", value);
-                FuCacheSpecialBeautyValue(handle, "eye_bright", value);
-            }
-            (void)fuItemGetParamd(handle, sdkKey.UTF8String);
+            double value = [options[@"value"] doubleValue];
+            // 统一走渲染队列 + KVC 映射到 FUBeauty 属性（对齐 Android runOnNamaGl 写参）
+            [FURenderKitCameraView enqueueBeautyParam:handle name:key value:value];
         }
-        data[@"ret"] = @(retBlock);
+        data[@"ret"] = @(0);
         callback(@{ @"code": @(0), @"data": data }, NO);
     } @catch (NSException *exception) {
         callback(@{ @"code": @(-1), @"message": exception.reason ?: @"setParam 异常" }, NO);
+    }
+}
+
+UNI_EXPORT_METHOD(@selector(bulkSetParams:callback:))
+- (void)bulkSetParams:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    @try {
+        [self ensureInitialized];
+        NSArray *items = options[@"items"];
+        if (![items isKindOfClass:[NSArray class]] || items.count == 0) {
+            callback(@{ @"code": @(0), @"data": @{ @"applied": @(0) } }, NO);
+            return;
+        }
+        int handle = [options[@"handle"] intValue];
+        if (handle <= 0) {
+            handle = _beautyHandle;
+        }
+        for (NSDictionary *item in items) {
+            if (![item isKindOfClass:[NSDictionary class]]) {
+                continue;
+            }
+            NSString *key = item[@"key"];
+            if (key.length == 0) {
+                continue;
+            }
+            NSString *stringValue = item[@"stringValue"];
+            if (stringValue.length > 0) {
+                [FURenderKitCameraView enqueueBeautyParamString:handle name:key value:stringValue];
+            } else {
+                [FURenderKitCameraView enqueueBeautyParam:handle name:key value:[item[@"value"] doubleValue]];
+            }
+        }
+        // 只入队不主动 flush：写参统一由渲染线程每帧应用（对齐单条 setParam），
+        // 避免在桥接线程直接改 FUBeauty 属性与 GL 线程竞争。
+        callback(@{ @"code": @(0), @"data": @{ @"applied": @(items.count) } }, NO);
+    } @catch (NSException *exception) {
+        callback(@{ @"code": @(-1), @"message": exception.reason ?: @"bulkSetParams 异常" }, NO);
     }
 }
 
@@ -1824,6 +1623,16 @@ UNI_EXPORT_METHOD(@selector(drainSdkLog:))
 - (void)drainSdkLog:(UniModuleKeepAliveCallback)callback {
     if (callback) {
         callback(@{ @"code": @(0), @"data": @"" }, NO);
+    }
+}
+
+/** 前端阶段标记：记录 JS 关键步骤时间戳到 diag，定位初始化慢点 */
+UNI_EXPORT_METHOD(@selector(mark:callback:))
+- (void)mark:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    NSString *step = [options isKindOfClass:[NSDictionary class]] ? options[@"step"] : nil;
+    [self appendDiagFile:[NSString stringWithFormat:@"MARK %@", step ?: @"?"]];
+    if (callback) {
+        callback(@{ @"code": @(0), @"data": @(0) }, NO);
     }
 }
 
@@ -1839,7 +1648,6 @@ UNI_EXPORT_METHOD(@selector(bindMediaBeautyHandle:callback:))
         return;
     }
     FuBeautySetPipelineHandle(YES, handle);
-    FuEnableAdvancedBeautyRuntime(handle);
     FU_LOG("bindMediaBeautyHandle handle=%d camera=%d media=%d", handle, FuBeautyCameraHandle, FuBeautyMediaHandle);
     callback(@{
         @"code": @(0),
@@ -1856,43 +1664,23 @@ UNI_EXPORT_METHOD(@selector(onFrame:callback:))
     int textureId = [options[@"textureId"] intValue];
     int width = [options[@"width"] intValue];
     int height = [options[@"height"] intValue];
-    int flags = [options[@"flags"] intValue];
 
     if (textureId <= 0 || width <= 0 || height <= 0) {
         callback(@{ @"code": @(-1), @"message": @"textureId / width / height 无效" }, NO);
         return;
     }
 
-    int items[1] = { _beautyHandle > 0 ? _beautyHandle : 0 };
-    int itemCount = _beautyHandle > 0 ? 1 : 0;
-    unsigned int inTex = (unsigned int)textureId;
-    unsigned int outTex = (unsigned int)textureId;
-    _frameId += 1;
-
-    int ret = fuRender(
-        FU_FORMAT_RGBA_TEXTURE,
-        &outTex,
-        FU_FORMAT_RGBA_TEXTURE,
-        &inTex,
-        width,
-        height,
-        _frameId,
-        items,
-        itemCount,
-        flags,
-        NULL
-    );
-
-    callback(@{
-        @"code": @(0),
-        @"data": @{ @"result": @(ret), @"textureId": @(outTex) }
-    }, NO);
+    // JS 层未调用本方法；官方 FURenderKit 已接管相机/图片/视频渲染，旧的 fuRender 纹理外链已废弃。
+    // 保留签名，直接返回「不支持」，避免残留旧 C API 造成未定义符号。
+    callback(@{ @"code": @(-1), @"message": @"onFrame 已废弃，请使用官方 FURenderKit 渲染链路" }, NO);
 }
 
 #pragma mark - Camera overlay (对齐 Android NamaModule)
 
 UNI_EXPORT_METHOD(@selector(showCamera:callback:))
 - (void)showCamera:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
+    [self appendDiagFile:[NSString stringWithFormat:
+        @"showCamera entered x=%@ y=%@ w=%@ h=%@", options[@"x"], options[@"y"], options[@"width"], options[@"height"]]];
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             [self ensureInitialized];
@@ -1918,8 +1706,8 @@ UNI_EXPORT_METHOD(@selector(showCamera:callback:))
                     @"code": @(0),
                     @"data": @{
                         @"hosted": @(YES),
-                        @"cameraError": [BeautyCameraView lastError] ?: @"",
-                        @"diag": [BeautyCameraView previewDiag] ?: @"",
+                        @"cameraError": [FURenderKitCameraView lastError] ?: @"",
+                        @"diag": [FURenderKitCameraView previewDiag] ?: @"",
                     }
                 }, NO);
                 return;
@@ -1975,8 +1763,8 @@ UNI_EXPORT_METHOD(@selector(showCamera:callback:))
                         @"reused": @(YES),
                         @"resized": @(YES),
                         @"resizeOnly": @(resizeOnly),
-                        @"cameraError": [BeautyCameraView lastError] ?: @"",
-                        @"diag": [BeautyCameraView previewDiag] ?: @"",
+                        @"cameraError": [FURenderKitCameraView lastError] ?: @"",
+                        @"diag": [FURenderKitCameraView previewDiag] ?: @"",
                         @"boxFrame": NSStringFromCGRect(boxFrame),
                     }
                 }, NO);
@@ -2035,18 +1823,18 @@ UNI_EXPORT_METHOD(@selector(showCamera:callback:))
     previewBox.layer.zPosition = 10000.f;
     [host addSubview:previewBox];
 
-    BeautyCameraView *view = [[BeautyCameraView alloc] initWithFrame:previewBox.bounds];
+    FURenderKitCameraView *view = [[FURenderKitCameraView alloc] initWithFrame:previewBox.bounds];
     view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     view.layer.zPosition = 10001.f;
     view.clipsToBounds = YES;
     view.userInteractionEnabled = NO;
     [previewBox addSubview:view];
     [view bindLayoutSize:pxW height:pxH];
-    [BeautyCameraView resetSessionDiag];
+    [FURenderKitCameraView resetSessionDiag];
     [view setNeedsLayout];
     [view layoutIfNeeded];
-    [view display];
-    [view startPreview];
+    // 相机由 didMoveToWindow 延迟到 view 稳定后启动（避免上窗瞬间 startInternalCamera 阻塞主线程约 9s）
+    [view startPreviewIfWindowStable];
 
     sOverlayCameraView = view;
     sOverlayCameraHost = host;
@@ -2070,8 +1858,8 @@ UNI_EXPORT_METHOD(@selector(showCamera:callback:))
             @"width": @(width),
             @"height": @(height),
             @"reused": @(NO),
-            @"cameraError": [BeautyCameraView lastError] ?: @"",
-            @"diag": [BeautyCameraView previewDiag] ?: @"",
+            @"cameraError": [FURenderKitCameraView lastError] ?: @"",
+            @"diag": [FURenderKitCameraView previewDiag] ?: @"",
             @"boxFrame": NSStringFromCGRect(boxFrame),
             @"rootClass": NSStringFromClass([parent class]),
             @"windowLevel": @(sOverlayWindow ? sOverlayWindow.windowLevel : 0),
@@ -2091,7 +1879,7 @@ UNI_EXPORT_METHOD(@selector(showCamera:callback:))
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         FU_LOG("previewDiag %@ view=%dx%d box=%dx%d hostHidden=%@",
-               [BeautyCameraView previewDiag],
+               [FURenderKitCameraView previewDiag],
                (int)view.bounds.size.width,
                (int)view.bounds.size.height,
                width,
@@ -2183,13 +1971,39 @@ UNI_EXPORT_METHOD(@selector(resizeCameraPreview:callback:))
     [self showCamera:opts callback:callback];
 }
 
+- (void)setVideoOverlaySuppressed:(BOOL)suppressed {
+    if (suppressed) {
+        sVideoOverlayBringGen += 1;
+        sVideoOverlaySuppressed = YES;
+        if (sOverlayVideoHost) {
+            sOverlayVideoHost.hidden = YES;
+        }
+        if (sOverlayWindow) {
+            sOverlayWindow.hidden = YES;
+        }
+        [self hideMediaBackButton];
+    } else {
+        sVideoOverlaySuppressed = NO;
+    }
+}
+
+- (void)showVideoOverlayIfNeeded {
+    sVideoOverlaySuppressed = NO;
+    if (sOverlayWindow) {
+        sOverlayWindow.hidden = NO;
+    }
+    if (sOverlayVideoHost) {
+        sOverlayVideoHost.hidden = NO;
+    }
+    // previewBox 在换源 reload 时会先 hidden，等 onFirstFrame 再显示，避免闪旧帧
+}
+
 UNI_EXPORT_METHOD(@selector(setOverlayWindowsHidden:callback:))
 - (void)setOverlayWindowsHidden:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
     dispatch_async(dispatch_get_main_queue(), ^{
         BOOL hidden = [options[@"hidden"] boolValue];
         //  只藏相机/视频专用窗，绝不隐藏业务主窗口（系统 Alert 依赖主窗）
         if (hidden) {
-            //  有视频host 时勿整窗 hidden（马上要挂视频）；纯相机/导入选择页可整窗藏，避免冻帧盖住下层页
             [self dismissPreviewChrome];
             if (sOverlayCameraView) {
                 [sOverlayCameraView hidePreview];
@@ -2198,19 +2012,18 @@ UNI_EXPORT_METHOD(@selector(setOverlayWindowsHidden:callback:))
                 sOverlayCameraHost.hidden = YES;
             }
             if (sOverlayVideoHost) {
-                sOverlayVideoHost.hidden = YES;
-            }
-            if (!sOverlayVideoHost && sOverlayWindow) {
+                [self setVideoOverlaySuppressed:YES];
+            } else if (sOverlayWindow) {
                 sOverlayWindow.hidden = YES;
             }
         } else {
+            [self setVideoOverlaySuppressed:NO];
             if (sOverlayWindow) {
                 sOverlayWindow.hidden = NO;
             }
             // 只恢复视频叠层；相机必须由resumeCameraPreview / showCamera 显式恢复
-            // （否则图片美颜页会把相机冻帧盖回来）
             if (sOverlayVideoHost) {
-                sOverlayVideoHost.hidden = NO;
+                [self showVideoOverlayIfNeeded];
                 [self bringVideoOverlayToFront];
             }
         }
@@ -2220,54 +2033,8 @@ UNI_EXPORT_METHOD(@selector(setOverlayWindowsHidden:callback:))
 
 UNI_EXPORT_METHOD(@selector(getDevicePerformanceLevel:))
 - (void)getDevicePerformanceLevel:(UniModuleKeepAliveCallback)callback {
-    int level = FuClampedDevicePerformanceLevel();
+    int level = FuDevicePerformanceLevelCached();
     callback(@{ @"code": @(0), @"data": @{ @"level": @(level) } }, NO);
-}
-
-UNI_EXPORT_METHOD(@selector(requestPermissions:))
-- (void)requestPermissions:(UniModuleKeepAliveCallback)callback {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        __block BOOL cameraGranted = NO;
-        __block BOOL micGranted = NO;
-        __block int pending = 2;
-        dispatch_block_t finish = ^{
-            pending--;
-            if (pending > 0) {
-                return;
-            }
-            callback(@{
-                @"code": @(0),
-                @"data": @{
-                    @"camera": @(cameraGranted),
-                    @"microphone": @(micGranted),
-                }
-            }, NO);
-        };
-        AVAuthorizationStatus camSt = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
-        if (camSt == AVAuthorizationStatusAuthorized) {
-            cameraGranted = YES;
-            finish();
-        } else if (camSt == AVAuthorizationStatusNotDetermined) {
-            [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
-                cameraGranted = granted;
-                finish();
-            }];
-        } else {
-            finish();
-        }
-        AVAuthorizationStatus micSt = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
-        if (micSt == AVAuthorizationStatusAuthorized) {
-            micGranted = YES;
-            finish();
-        } else if (micSt == AVAuthorizationStatusNotDetermined) {
-            [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
-                micGranted = granted;
-                finish();
-            }];
-        } else {
-            finish();
-        }
-    });
 }
 
 UNI_EXPORT_METHOD(@selector(getPreviewDiag:))
@@ -2275,16 +2042,16 @@ UNI_EXPORT_METHOD(@selector(getPreviewDiag:))
     callback(@{
         @"code": @(0),
         @"data": @{
-            @"diag": [BeautyCameraView previewDiag] ?: @"",
+            @"diag": [FURenderKitCameraView previewDiag] ?: @"",
             @"mounted": @(sOverlayCameraView != nil),
-            @"stats": [BeautyCameraView previewStats] ?: @{},
+            @"stats": [FURenderKitCameraView previewStats] ?: @{},
         }
     }, NO);
 }
 
 UNI_EXPORT_METHOD(@selector(getPreviewStats:))
 - (void)getPreviewStats:(UniModuleKeepAliveCallback)callback {
-    NSDictionary *stats = [BeautyCameraView previewStats] ?: @{};
+    NSDictionary *stats = [FURenderKitCameraView previewStats] ?: @{};
     NSNumber *tracking = stats[@"tracking"];
     NSNumber *frameCount = stats[@"frameCount"];
     if (sPreviewChromeView && tracking) {
@@ -2367,7 +2134,7 @@ UNI_EXPORT_METHOD(@selector(setBeautyEnabled:callback:))
                 enabled = [options[@"enabled"] boolValue];
             }
         }
-        [BeautyCameraView setBeautyEnabledGlobal:enabled];
+        [FURenderKitCameraView setBeautyEnabledGlobal:enabled];
         if (sOverlayCameraView) {
             [sOverlayCameraView setBeautyEnabled:enabled];
         }
@@ -2396,7 +2163,11 @@ UNI_EXPORT_METHOD(@selector(switchCamera:))
         [sOverlayCameraView switchCameraFacingWithCompletion:^(NSError *error) {
             if (callback) {
                 if (error) {
-                    callback(@{ @"code": @(-1), @"message": error.localizedDescription ?: @"切换摄像头失败" }, NO);
+                    NSString *msg = error.localizedDescription ?: @"切换摄像头失败";
+                    if ([msg isEqualToString:@"设备不支持该分辨率"]) {
+                        [self presentOverlayToast:msg durationMs:1500];
+                    }
+                    callback(@{ @"code": @(-1), @"message": msg }, NO);
                 } else {
                     callback(@{ @"code": @(0), @"data": @(0) }, NO);
                 }
@@ -2407,24 +2178,34 @@ UNI_EXPORT_METHOD(@selector(switchCamera:))
 
 UNI_EXPORT_METHOD(@selector(setPreviewResolution:callback:))
 - (void)setPreviewResolution:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        int width = [options[@"width"] intValue];
-        int height = [options[@"height"] intValue];
-        if (width <= 0 || height <= 0) {
+    int width = [options[@"width"] intValue];
+    int height = [options[@"height"] intValue];
+    FU_LOG("setPreviewResolution width=%d height=%d", width, height);
+    if (width <= 0 || height <= 0) {
+        if (callback) {
             callback(@{ @"code": @(-1), @"message": @"width/height 无效" }, NO);
-            return;
         }
-        [BeautyCameraView setTargetPreviewSize:width height:height];
-        if (sOverlayCameraView) {
-            [sOverlayCameraView restartPreview];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    [FURenderKitCameraView applyPreviewResolutionWidth:width
+                                                height:height
+                                    unsupportedHandler:^{
+        [weakSelf presentOverlayToast:@"设备不支持该分辨率" durationMs:1500];
+    }
+                                            completion:^(__unused BOOL applied) {
+        if (callback) {
+            callback(@{ @"code": @(0), @"data": @(0) }, NO);
         }
-        callback(@{ @"code": @(0), @"data": @(0) }, NO);
-    });
+    }];
 }
 
 UNI_EXPORT_METHOD(@selector(resetPreviewResolution:))
 - (void)resetPreviewResolution:(UniModuleKeepAliveCallback)callback {
-    [BeautyCameraView resetTargetPreviewSizeToDefault];
+    [FURenderKitCameraView resetTargetPreviewSizeToDefault];
+    if (sOverlayCameraView && [sOverlayCameraView isPreviewStarted]) {
+        [FURenderKitCameraView applyTargetPreviewSizeToCamera];
+    }
     if (callback) {
         callback(@{ @"code": @(0), @"data": @(0) }, NO);
     }
@@ -2727,7 +2508,6 @@ UNI_EXPORT_METHOD(@selector(processImage:callback:))
             [self ensureInitialized];
             if (FuBeautyMediaHandle <= 0 && FuBeautyCameraHandle > 0) {
                 FuBeautySetPipelineHandle(YES, FuBeautyCameraHandle);
-                FuEnableAdvancedBeautyRuntime(FuBeautyCameraHandle);
             }
             NSString *path = options[@"path"];
             if (![path isKindOfClass:[NSString class]] || path.length == 0) {
@@ -2778,7 +2558,7 @@ UNI_EXPORT_METHOD(@selector(processImage:callback:))
             }
 
             CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-            //  非预乘BGRA：FU 常把 alpha 写成 0，预乘路径会导出成白图
+            // 非预乘BGRA：FU 常把 alpha 写成 0，预乘路径会导出成白图
             CGContextRef ctx = CGBitmapContextCreate(
                 bgra,
                 width,
@@ -2799,10 +2579,8 @@ UNI_EXPORT_METHOD(@selector(processImage:callback:))
             CGContextDrawImage(ctx, CGRectMake(0, 0, width, height), cgImage);
             CGContextRelease(ctx);
 
-            __block int ret = -1;
-            __block int sysErr = 0;
             NSError *glErr = nil;
-            if (![BeautyCameraView ensureSharedGLContextReady:&glErr]) {
+            if (![FURenderKitCameraView ensureSharedGLContextReady:&glErr]) {
                 free(bgra);
                 callback(@{
                     @"code": @(-1),
@@ -2810,45 +2588,26 @@ UNI_EXPORT_METHOD(@selector(processImage:callback:))
                 }, NO);
                 return;
             }
-            [BeautyCameraView performWithSharedGLLock:^{
-                fuMakeGLContextCurrent();
-                [BeautyCameraView flushPendingBeautyParams];
-                fuMakeGLContextCurrent();
-                FuReconfirmSpecialBeautySwitches(handle);
-                fuSetDefaultRotationMode(FU_ROTATION_MODE_0);
-                fuSetInputCameraMatrix(0, 0, FU_ROTATION_MODE_0);
-                fuSetInputCameraBufferMatrix(CCROT0);
-                fuSetInputCameraBufferMatrixState(true);
-                fuSetInputCameraTextureMatrixState(false);
-                fuSetOutputMatrixState(false);
-                fuSetOutputResolution((int)width, (int)height);
-                fuSetFaceProcessorDetectMode(0);
-                _frameId += 1;
-                int items[1] = { handle };
-                ret = fuRender(
-                    FU_FORMAT_BGRA_BUFFER,
-                    bgra,
-                    FU_FORMAT_BGRA_BUFFER,
-                    bgra,
-                    (int)width,
-                    (int)height,
-                    _frameId,
-                    items,
-                    1,
-                    NAMA_RENDER_FEATURE_FULL,
-                    NULL
-                );
-                sysErr = fuGetSystemError();
-                fuSetFaceProcessorDetectMode(1);
+            // 官方 FURenderKit 渲染：renderWithInput 会自动应用已挂载的 [FURenderKit shareRenderKit].beauty，
+            // 无需再传 item handle。onlyOutputTexture=NO 时结果读回输入 imageBuffer。
+            __block BOOL renderOK = NO;
+            [FURenderKitCameraView performWithSharedGLLock:^{
+                [FURenderKitCameraView flushPendingBeautyParams];
+                FURenderInput *input = [[FURenderInput alloc] init];
+                input.imageBuffer = FUImageBufferMakeBGRA(bgra, width, height, bytesPerRow);
+                input.renderConfig.imageOrientation = FUImageOrientationUP;
+                input.renderConfig.autoDisplay = NO;
+                input.renderConfig.onlyOutputTexture = NO;
+                FURenderOutput *output = [[FURenderKit shareRenderKit] renderWithInput:input];
+                renderOK = (output != nil);
             }];
-            if (ret < 0 || sysErr != 0) {
+            if (!renderOK) {
                 free(bgra);
-                NSString *errStr = sysErr != 0
-                    ? [NSString stringWithUTF8String:fuGetSystemErrorString(sysErr)]
-                    : @"";
+                NSString *errStr = [FURenderKit getSystemErrorString] ?: @"";
+                int sysErr = [FURenderKit getSystemError];
                 callback(@{
                     @"code": @(-1),
-                    @"message": [NSString stringWithFormat:@"fuRender 失败 ret=%d sys=%d %@", ret, sysErr, errStr ?: @""]
+                    @"message": [NSString stringWithFormat:@"renderWithInput 失败 sys=%d %@", sysErr, errStr ?: @""]
                 }, NO);
                 return;
             }
@@ -2918,8 +2677,10 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
                 return;
             }
 
+            NSString *normPath = [self normalizeLocalPath:path];
+
             //  同路径已挂载：只改预览框，避免面板展开时整段重载
-            if (sOverlayVideoView && sOverlayVideoHost && [sLastVideoPath isEqualToString:path]) {
+            if (sOverlayVideoView && sOverlayVideoHost && [sLastVideoPath isEqualToString:normPath]) {
                 int pxW = [self cssToPhysical:width];
                 int pxH = [self cssToPhysical:height];
                 CGRect boxFrame = [self previewBoxFrameOnDecor:x y:y width:width height:height];
@@ -2948,6 +2709,12 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
                 return;
             }
 
+            //  换源但 overlay 仍在（返回 import 再选视频）：原位 loadVideoPath，避免 destroy→remount
+            if (sOverlayVideoView && sOverlayVideoHost) {
+                [self reloadVideoOverlayInPlace:normPath options:opts callback:callback];
+                return;
+            }
+
             __weak typeof(self) weakSelf = self;
             [self destroyVideoPreviewInternal:^{
                 //  勿拆相机 GL：只软隐藏，媒体页可立刻挂视频
@@ -2959,6 +2726,85 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
             callback(@{ @"code": @(-1), @"message": exception.reason ?: @"showVideoPreview 异常" }, NO);
         }
     });
+}
+
+- (void)wireOverlayVideoCallbacks:(BeautyVideoView *)view {
+    __weak typeof(self) weakSelf = self;
+    view.onFirstFrame = ^{
+        if (view.superview) {
+            view.superview.hidden = NO;
+        }
+        if (sOverlayVideoPlayBtn) {
+            sOverlayVideoPlayBtn.hidden = NO;
+            [sOverlayVideoPlayBtn.superview bringSubviewToFront:sOverlayVideoPlayBtn];
+        }
+    };
+    view.onPlaybackEnded = ^{
+        if (sOverlayVideoPlayBtn) {
+            sOverlayVideoPlayBtn.hidden = NO;
+            [sOverlayVideoPlayBtn.superview bringSubviewToFront:sOverlayVideoPlayBtn];
+        }
+        [weakSelf fireVideoEvent:@"ended" extra:nil];
+    };
+}
+
+- (void)reloadVideoOverlayInPlace:(NSString *)normPath
+                          options:(NSDictionary *)options
+                         callback:(UniModuleKeepAliveCallback)callback {
+    int x = [options[@"x"] intValue];
+    int y = [options[@"y"] intValue];
+    int width = [options[@"width"] intValue];
+    int height = [options[@"height"] intValue];
+    int pxW = [self cssToPhysical:width];
+    int pxH = [self cssToPhysical:height];
+    CGRect boxFrame = [self previewBoxFrameOnDecor:x y:y width:width height:height];
+    UIView *previewBox = sOverlayVideoView.superview;
+    if (previewBox) {
+        previewBox.hidden = YES;
+        previewBox.frame = boxFrame;
+        sOverlayVideoView.frame = previewBox.bounds;
+    }
+    [sOverlayVideoView bindLayoutSize:pxW height:pxH];
+    [self wireOverlayVideoCallbacks:sOverlayVideoView];
+    if (sOverlayVideoPlayBtn) {
+        sOverlayVideoPlayBtn.hidden = YES;
+    }
+    NSError *loadErr = nil;
+    if (![sOverlayVideoView loadVideoPath:normPath error:&loadErr]) {
+        callback(@{ @"code": @(-1), @"message": loadErr.localizedDescription ?: @"加载视频失败" }, NO);
+        return;
+    }
+    [sOverlayVideoView prepareFirstFrame];
+    sLastVideoPath = [normPath copy];
+    sLastCssX = x;
+    sLastCssY = y;
+    sLastCssW = width;
+    sLastCssH = height;
+    sVideoOverlayBringGen += 1;
+    if (!sVideoOverlaySuppressed) {
+        [self showVideoOverlayIfNeeded];
+        [self bringVideoOverlayToFront];
+    }
+    if (sBeautyPanelView) {
+        NSString *mode = sBeautyPanelView.mode ?: @"video";
+        UIView *panelParent = [self resolveBeautyPanelParentForMode:mode];
+        if (panelParent && sBeautyPanelView.superview != panelParent) {
+            [sBeautyPanelView removeFromSuperview];
+            [panelParent addSubview:sBeautyPanelView];
+        }
+        [self syncBeautyPanelLayout];
+    }
+    FU_LOG("showVideoPreview reloaded in place path=%@", normPath);
+    callback(@{
+        @"code": @(0),
+        @"data": @{
+            @"x": @(x),
+            @"y": @(y),
+            @"width": @(width),
+            @"height": @(height),
+            @"reloaded": @(YES),
+        }
+    }, NO);
 }
 
 - (void)mountVideoOverlay:(NSDictionary *)options callback:(UniModuleKeepAliveCallback)callback {
@@ -2996,7 +2842,6 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
     //  媒体 handle 未绑定时复用相机 handle（与 JS initNamaForMedia 对齐）
     if (FuBeautyMediaHandle <= 0 && FuBeautyCameraHandle > 0) {
         FuBeautySetPipelineHandle(YES, FuBeautyCameraHandle);
-        FuEnableAdvancedBeautyRuntime(FuBeautyCameraHandle);
         FU_LOG("mountVideoOverlay reuse cameraHandle=%d as media", FuBeautyCameraHandle);
     }
 
@@ -3008,9 +2853,9 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
 
     UIButton *playBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     playBtn.tag = kFuChromeInteractiveTag;
-    // 上移：避免与底部保存/下载钮叠在一起（约在取景框垂直 32% 处）
+    // 垂直水平都居中：标准视频播放器的中央播放钮
     CGFloat playSize = 85;
-    CGFloat playY = MAX(24, CGRectGetHeight(previewBox.bounds) * 0.32 - playSize * 0.5);
+    CGFloat playY = (CGRectGetHeight(previewBox.bounds) - playSize) * 0.5;
     playBtn.frame = CGRectMake((CGRectGetWidth(previewBox.bounds) - playSize) * 0.5,
                                playY, playSize, playSize);
     playBtn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
@@ -3046,17 +2891,35 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
     [previewBox addSubview:playBtn];
     sOverlayVideoPlayBtn = playBtn;
 
+    NSError *loadErr = nil;
+    if (![view loadVideoPath:path error:&loadErr]) {
+        [view removeFromSuperview];
+        [host removeFromSuperview];
+        sOverlayVideoPlayBtn = nil;
+        callback(@{ @"code": @(-1), @"message": loadErr.localizedDescription ?: @"加载视频失败" }, NO);
+        return;
+    }
+
+    [self wireOverlayVideoCallbacks:view];
+    // 默认暂停 + 首帧；不循环播放
+    [view prepareFirstFrame];
+
     sOverlayVideoView = view;
     sOverlayVideoHost = host;
-    sLastVideoPath = [path copy];
+    sLastVideoPath = [[self normalizeLocalPath:path] copy];
     sLastCssX = x;
     sLastCssY = y;
     sLastCssW = width;
     sLastCssH = height;
-    if (sOverlayWindow) {
-        sOverlayWindow.hidden = NO;
+    sVideoOverlayBringGen += 1;
+    NSInteger bringGen = sVideoOverlayBringGen;
+    if (!sVideoOverlaySuppressed) {
+        [self showVideoOverlayIfNeeded];
+        if (sOverlayWindow) {
+            sOverlayWindow.hidden = NO;
+        }
+        [self bringVideoOverlayToFront];
     }
-    [self bringVideoOverlayToFront];
     // 面板若已创建，挪到视频 host，避免仍挂在隐藏相机层
     if (sBeautyPanelView) {
         NSString *mode = sBeautyPanelView.mode ?: @"video";
@@ -3068,9 +2931,8 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
         [self syncBeautyPanelLayout];
     }
 
-    FU_LOG("showVideoPreview hostReady css:%dx%d@%d,%d box=%@ path=%@ mediaHandle=%d",
+    FU_LOG("showVideoPreview css:%dx%d@%d,%d box=%@ path=%@ mediaHandle=%d",
            width, height, x, y, NSStringFromCGRect(boxFrame), path, FuBeautyMediaHandle);
-    // 先回传：黑底宿主已上屏，JS 可立刻挂面板；解码/首帧美颜下一拍再做，避免长时间黑屏干等
     callback(@{
         @"code": @(0),
         @"data": @{
@@ -3081,50 +2943,21 @@ UNI_EXPORT_METHOD(@selector(showVideoPreview:callback:))
         }
     }, NO);
 
-    NSString *pathCopy = [path copy];
-    __weak typeof(self) weakSelf = self;
-    __weak BeautyVideoView *weakView = view;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) self = weakSelf;
-        BeautyVideoView *v = weakView;
-        if (!self || !v || v != sOverlayVideoView) {
-            return;
-        }
-        NSError *loadErr = nil;
-        if (![v loadVideoPath:pathCopy error:&loadErr]) {
-            FU_LOG("showVideoPreview loadVideo failed: %@", loadErr.localizedDescription);
-            [self fireVideoEvent:@"error" extra:@{
-                @"message": loadErr.localizedDescription ?: @"加载视频失败"
-            }];
-            return;
-        }
-        v.onFirstFrame = ^{
-            if (sOverlayVideoPlayBtn) {
-                sOverlayVideoPlayBtn.hidden = NO;
-                [sOverlayVideoPlayBtn.superview bringSubviewToFront:sOverlayVideoPlayBtn];
+    for (NSNumber *delay in @[ @0.3, @0.8, @1.5 ]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (bringGen != sVideoOverlayBringGen || sVideoOverlaySuppressed) {
+                return;
             }
-        };
-        v.onPlaybackEnded = ^{
-            if (sOverlayVideoPlayBtn) {
-                sOverlayVideoPlayBtn.hidden = NO;
-                [sOverlayVideoPlayBtn.superview bringSubviewToFront:sOverlayVideoPlayBtn];
-            }
-            [weakSelf fireVideoEvent:@"ended" extra:nil];
-        };
-        [v prepareFirstFrame];
-        for (NSNumber *delay in @[ @0.3, @0.8, @1.5 ]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [weakSelf bringVideoOverlayToFront];
-                if (sBeautyPanelView) {
-                    [weakSelf syncBeautyPanelLayout];
-                    UIView *parent = sBeautyPanelView.superview;
-                    if (parent) {
-                        [weakSelf ensureMediaBackButtonOnParent:parent];
-                    }
+            [self bringVideoOverlayToFront];
+            if (sBeautyPanelView) {
+                [self syncBeautyPanelLayout];
+                UIView *parent = sBeautyPanelView.superview;
+                if (parent) {
+                    [self ensureMediaBackButtonOnParent:parent];
                 }
-            });
-        }
-    });
+            }
+        });
+    }
 }
 
 UNI_EXPORT_METHOD(@selector(pauseVideoPreview:))
@@ -3180,7 +3013,6 @@ UNI_EXPORT_METHOD(@selector(processVideo:callback:))
         }
         if (FuBeautyMediaHandle <= 0 && FuBeautyCameraHandle > 0) {
             FuBeautySetPipelineHandle(YES, FuBeautyCameraHandle);
-            FuEnableAdvancedBeautyRuntime(FuBeautyCameraHandle);
         }
         int handle = FuBeautyMediaHandle > 0
             ? FuBeautyMediaHandle
@@ -3192,13 +3024,54 @@ UNI_EXPORT_METHOD(@selector(processVideo:callback:))
         if (callback) {
             callback(@{ @"code": @(0), @"data": @{ @"pending": @(1) } }, YES);
         }
-        // 导出前暂停预览，避免争用 GL（processVideo 常在主线程，禁止 dispatch_sync main）
-        [self showExportProgressHudRatio:0.f];
-        sExportCancelled = NO;
-        void (^pausePreviewForExport)(void) = ^{
-            if (sOverlayVideoView) {
-                [sOverlayVideoView pause];
+        // 导出前暂停预览，避免争用 GL / 双 FUVideoReader 读同一文件（对齐官方 stopReading → startProcessing）
+        [self showExportProgressHud:@"导出中 0%"];
+        NSString *realPath = [self normalizeLocalPath:path];
+        __weak typeof(self) weakSelf = self;
+        BeautyVideoView *previewView = sOverlayVideoView;
+        void (^startExport)(void) = ^{
+            [FURenderKitCameraView performWithSharedGLLock:^{
+                [FURenderKitCameraView flushPendingBeautyParams];
+            }];
+            [VideoBeautyExporter exportVideoAtPath:realPath
+                                      beautyHandle:handle
+                                    maxDurationSec:60
+                                           maxSide:1280
+                                          progress:^(float p) {
+                int pct = (int)lroundf(MAX(0.f, MIN(1.f, p)) * 100.f);
+                [weakSelf showExportProgressHud:[NSString stringWithFormat:@"导出中 %d%%", pct]];
             }
+                                        completion:^(NSString *outPath, NSError *error) {
+                [weakSelf hideExportProgressHud];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    // 导出前 pausePreviewForExport 隐藏了视频宿主容器，这里必须放回
+                    // （对齐 resumeVideoPreview 的恢复路径），否则导出结束页面黑屏
+                    if (sOverlayVideoHost) {
+                        sOverlayVideoHost.hidden = NO;
+                    }
+                    if (sOverlayVideoView) {
+                        [sOverlayVideoView resumeAfterExport];
+                    }
+                    if (sOverlayVideoPlayBtn) {
+                        sOverlayVideoPlayBtn.hidden = NO;
+                    }
+                    if (sBeautyPanelView) {
+                        sBeautyPanelView.userInteractionEnabled = YES;
+                    }
+                });
+                if (error || outPath.length == 0) {
+                    callback(@{
+                        @"code": @(-1),
+                        @"message": error.localizedDescription ?: @"视频导出失败"
+                    }, NO);
+                    return;
+                }
+                callback(@{ @"code": @(0), @"data": @{ @"path": outPath } }, NO);
+            }];
+        };
+        void (^pausePreviewForExport)(void) = ^{
+            // 对齐官方 FULiveDemo：导出时保留末帧在 GL 视图，不隐藏宿主容器，
+            // 由 HUD 半透明黑罩压暗画面，而不是黑屏
             if (sOverlayVideoPlayBtn) {
                 sOverlayVideoPlayBtn.hidden = YES;
             }
@@ -3211,42 +3084,13 @@ UNI_EXPORT_METHOD(@selector(processVideo:callback:))
         } else {
             dispatch_sync(dispatch_get_main_queue(), pausePreviewForExport);
         }
-        // 导出前 flush 排队美颜参，避免调参后保存仍是旧效果/空写
-        [BeautyCameraView performWithSharedGLLock:^{
-            [BeautyCameraView flushPendingBeautyParams];
-        }];
-        NSString *realPath = [self normalizeLocalPath:path];
-        __weak typeof(self) weakSelf = self;
-        [VideoBeautyExporter exportVideoAtPath:realPath
-                                  beautyHandle:handle
-                                maxDurationSec:60
-                                       maxSide:1280
-                                      progress:^(float p) {
-            [weakSelf showExportProgressHudRatio:p];
+        if (previewView) {
+            [previewView suspendForExportWithCompletion:^{
+                startExport();
+            }];
+        } else {
+            startExport();
         }
-                                    completion:^(NSString *outPath, NSError *error) {
-            [weakSelf hideExportProgressHud];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (sOverlayVideoPlayBtn) {
-                    sOverlayVideoPlayBtn.hidden = NO;
-                }
-                if (sBeautyPanelView) {
-                    sBeautyPanelView.userInteractionEnabled = YES;
-                }
-            });
-            if (sExportCancelled || [error.domain isEqualToString:@"FaceUnityNama"] && error.code == -2) {
-                callback(@{ @"code": @(-2), @"message": @"导出已取消" }, NO);
-                return;
-            }
-            if (error || outPath.length == 0) {
-                callback(@{
-                    @"code": @(-1),
-                    @"message": error.localizedDescription ?: @"视频导出失败"
-                }, NO);
-                return;
-            }
-            callback(@{ @"code": @(0), @"data": @{ @"path": outPath } }, NO);
-        }];
     } @catch (NSException *exception) {
         [self hideExportProgressHud];
         callback(@{ @"code": @(-1), @"message": exception.reason ?: @"processVideo 异常" }, NO);
@@ -3254,13 +3098,13 @@ UNI_EXPORT_METHOD(@selector(processVideo:callback:))
 }
 
 - (void)bringVideoOverlayToFront {
-    if (!sOverlayVideoHost) {
+    if (sVideoOverlaySuppressed || !sOverlayVideoHost) {
         return;
     }
     [self syncOverlayWindowLevel];
     [self attachOverlayHostOnDecor:nil host:sOverlayVideoHost];
     sOverlayVideoHost.hidden = NO;
-    if (sOverlayWindow) {
+    if (sOverlayWindow && !sVideoOverlaySuppressed) {
         sOverlayWindow.hidden = NO;
     }
 }
@@ -3285,12 +3129,18 @@ UNI_EXPORT_METHOD(@selector(processVideo:callback:))
     sOverlayVideoHost = nil;
     sOverlayVideoPlayBtn = nil;
     sLastVideoPath = nil;
-    [view detachAndScheduleGLRelease];
-    [view removeFromSuperview];
-    [host removeFromSuperview];
-    if (onComplete) {
-        onComplete();
-    }
+    // 先隐藏再销毁，避免销毁过程中闪现最后一帧
+    host.hidden = YES;
+    [view pause];
+    sVideoOverlayBringGen += 1;
+    sVideoOverlaySuppressed = YES;
+    [view stopAndReleaseWhenIdle:^{
+        [view removeFromSuperview];
+        [host removeFromSuperview];
+        if (onComplete) {
+            onComplete();
+        }
+    }];
 }
 
 - (NSString *)normalizeLocalPath:(NSString *)path {
@@ -3348,9 +3198,8 @@ UNI_EXPORT_METHOD(@selector(destroy:))
 - (void)destroy:(UniModuleKeepAliveCallback)callback {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self hideCameraInternal:^{
-            [BeautyCameraView shutdownSharedGLContext];
-            fuDestroyAllItems();
-            fuDestroyLibData();
+            [FURenderKitCameraView shutdownSharedGLContext];
+            [FURenderKit destroy];
             _beautyHandle = 0;
             FuBeautyClearAll();
             _frameId = 0;
@@ -3368,8 +3217,8 @@ UNI_EXPORT_METHOD(@selector(destroy:))
         @"width": @(width),
         @"height": @(height),
         @"reused": @(reused),
-        @"cameraError": [BeautyCameraView lastError] ?: @"",
-        @"diag": [BeautyCameraView previewDiag] ?: @"",
+        @"cameraError": [FURenderKitCameraView lastError] ?: @"",
+        @"diag": [FURenderKitCameraView previewDiag] ?: @"",
         @"boxFrame": NSStringFromCGRect(CGRectMake(x, y, width, height)),
     };
 }
@@ -3583,7 +3432,7 @@ UNI_EXPORT_METHOD(@selector(destroy:))
                (double)sOverlayWindow.windowLevel,
                biz ? (double)biz.windowLevel : -1.0);
     }
-    if (sOverlayWindow.hidden) {
+    if (sOverlayWindow.hidden && !sVideoOverlaySuppressed) {
         sOverlayWindow.hidden = NO;
     }
     return sOverlayWindow;
@@ -3619,7 +3468,7 @@ UNI_EXPORT_METHOD(@selector(destroy:))
     } else {
         [parent bringSubviewToFront:host];
     }
-    if (sOverlayWindow) {
+    if (sOverlayWindow && !sVideoOverlaySuppressed) {
         sOverlayWindow.hidden = NO;
     }
     FU_LOG("attachOverlay parent=%@ hostFrame=%@ winLevel=%.1f",
@@ -3645,13 +3494,13 @@ UNI_EXPORT_METHOD(@selector(destroy:))
     sOverlayCameraHost.hidden = NO;
     sOverlayCameraHost.alpha = 1;
     sOverlayCameraHost.userInteractionEnabled = YES;
-    if (sOverlayWindow) {
+    if (sOverlayWindow && !sVideoOverlaySuppressed) {
         sOverlayWindow.hidden = NO;
     }
     if (sOverlayCameraView) {
         sOverlayCameraView.hidden = NO;
         [sOverlayCameraHost setNeedsLayout];
-        [sOverlayCameraView display];
+        [sOverlayCameraView setNeedsDisplay];
     }
     if (sPreviewChromeView && sLastCssW > 0 && sLastCssH > 0) {
         [self syncPreviewChromeLayoutX:sLastCssX y:sLastCssY width:sLastCssW height:sLastCssH];
@@ -3739,8 +3588,7 @@ UNI_EXPORT_METHOD(@selector(destroy:))
     });
 }
 
-- (void)showExportProgressHudRatio:(float)ratio {
-    int pct = (int)lroundf(MAX(0.f, MIN(1.f, ratio)) * 100.f);
+- (void)showExportProgressHud:(NSString *)text {
     dispatch_async(dispatch_get_main_queue(), ^{
         CGRect screenBounds = UIScreen.mainScreen.bounds;
         if (!sExportProgressWindow) {
@@ -3757,6 +3605,9 @@ UNI_EXPORT_METHOD(@selector(destroy:))
             }
             win.windowLevel = UIWindowLevelAlert + 2.f;
             win.backgroundColor = [UIColor clearColor];
+            // UIWindow 默认 opaque=YES：不透明 window 即使 clearColor 也会盖住下层
+            // overlay window，末帧透不出来导致黑屏；必须显式置 NO 才能透出压暗末帧
+            win.opaque = NO;
             UIViewController *vc = [[UIViewController alloc] init];
             vc.view.backgroundColor = [UIColor clearColor];
             win.rootViewController = vc;
@@ -3767,91 +3618,45 @@ UNI_EXPORT_METHOD(@selector(destroy:))
             sExportProgressHud = [[UIView alloc] initWithFrame:root.bounds];
             sExportProgressHud.tag = 88219902;
             sExportProgressHud.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            sExportProgressHud.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+            sExportProgressHud.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
             sExportProgressHud.userInteractionEnabled = YES;
-
-            FuExportProgressRingView *ring = [[FuExportProgressRingView alloc] initWithFrame:CGRectMake(0, 0, 120, 120)];
-            ring.tag = 21;
-            ring.center = CGPointMake(CGRectGetMidX(sExportProgressHud.bounds), CGRectGetMidY(sExportProgressHud.bounds) - 24);
-            ring.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+            UIView *card = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 168, 96)];
+            card.tag = 11;
+            card.backgroundColor = [[UIColor colorWithWhite:0.12 alpha:1] colorWithAlphaComponent:0.96];
+            card.layer.cornerRadius = 12;
+            card.center = CGPointMake(CGRectGetMidX(sExportProgressHud.bounds), CGRectGetMidY(sExportProgressHud.bounds));
+            card.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
                 UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-            [sExportProgressHud addSubview:ring];
-            sExportProgressRing = ring;
-
-            UILabel *pctLab = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 120, 120)];
-            pctLab.tag = 22;
-            pctLab.center = ring.center;
-            pctLab.autoresizingMask = ring.autoresizingMask;
-            pctLab.textColor = [UIColor whiteColor];
-            pctLab.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
-            pctLab.textAlignment = NSTextAlignmentCenter;
-            [sExportProgressHud addSubview:pctLab];
-            sExportProgressPercentLabel = pctLab;
-
-            UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 200, 22)];
-            tip.tag = 23;
-            tip.center = CGPointMake(CGRectGetMidX(sExportProgressHud.bounds), CGRectGetMaxY(ring.frame) + 20);
-            tip.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
-                UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-            tip.textColor = [UIColor whiteColor];
-            tip.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-            tip.textAlignment = NSTextAlignmentCenter;
-            tip.text = @"导出中";
-            [sExportProgressHud addSubview:tip];
-            sExportProgressTipLabel = tip;
-
-            UIButton *cancel = [UIButton buttonWithType:UIButtonTypeCustom];
-            cancel.tag = 24;
-            cancel.frame = CGRectMake(0, 0, 120, 40);
-            cancel.center = CGPointMake(CGRectGetMidX(sExportProgressHud.bounds), CGRectGetMaxY(tip.frame) + 28);
-            cancel.autoresizingMask = tip.autoresizingMask;
-            [cancel setTitle:@"取消" forState:UIControlStateNormal];
-            [cancel setTitleColor:[[UIColor whiteColor] colorWithAlphaComponent:0.9] forState:UIControlStateNormal];
-            cancel.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-            cancel.layer.cornerRadius = 8;
-            cancel.layer.borderWidth = 1;
-            cancel.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.35].CGColor;
-            [cancel addTarget:sNamaModuleWeak action:@selector(onExportCancelTapped) forControlEvents:UIControlEventTouchUpInside];
-            [sExportProgressHud addSubview:cancel];
-            sExportProgressCancelBtn = cancel;
-
+            [sExportProgressHud addSubview:card];
+            UIActivityIndicatorView *spin = nil;
+            if (@available(iOS 13.0, *)) {
+                spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+            } else {
+                spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
+            }
+            spin.color = [UIColor whiteColor];
+            spin.center = CGPointMake(84, 36);
+            [spin startAnimating];
+            [card addSubview:spin];
+            sExportProgressLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 62, 152, 24)];
+            sExportProgressLabel.textColor = [UIColor whiteColor];
+            sExportProgressLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+            sExportProgressLabel.textAlignment = NSTextAlignmentCenter;
+            [card addSubview:sExportProgressLabel];
             [root addSubview:sExportProgressHud];
         }
         sExportProgressHud.frame = root.bounds;
-        sExportProgressRing.progress = ratio;
-        sExportProgressPercentLabel.text = [NSString stringWithFormat:@"%d%%", pct];
-        sExportProgressTipLabel.text = @"导出中";
+        sExportProgressLabel.text = text.length ? text : @"导出中";
         sExportProgressWindow.hidden = NO;
         [sExportProgressWindow makeKeyAndVisible];
     });
-}
-
-- (void)showExportProgressHud:(NSString *)text {
-    float ratio = 0.f;
-    if (text.length) {
-        NSScanner *scanner = [NSScanner scannerWithString:text];
-        int pct = 0;
-        if ([scanner scanString:@"导出中" intoString:NULL] && [scanner scanInt:&pct]) {
-            ratio = (float)pct / 100.f;
-        }
-    }
-    [self showExportProgressHudRatio:ratio];
-}
-
-- (void)onExportCancelTapped {
-    sExportCancelled = YES;
-    [VideoBeautyExporter cancelActiveExport];
 }
 
 - (void)hideExportProgressHud {
     dispatch_async(dispatch_get_main_queue(), ^{
         [sExportProgressHud removeFromSuperview];
         sExportProgressHud = nil;
-        sExportProgressPercentLabel = nil;
-        sExportProgressTipLabel = nil;
-        sExportProgressRing = nil;
-        sExportProgressCancelBtn = nil;
-        sExportCancelled = NO;
+        sExportProgressLabel = nil;
         if (sExportProgressWindow) {
             sExportProgressWindow.hidden = YES;
             sExportProgressWindow.rootViewController = nil;
@@ -3874,52 +3679,53 @@ UNI_EXPORT_METHOD(@selector(destroy:))
     if (title.length == 0) {
         return;
     }
-    // 滤镜名必须盖在原生美颜面板(z~30100)之上；PreviewChrome 在面板下层，走此处 overlay
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *root = sOverlayVideoHost ?: sOverlayCameraHost ?: [self resolveOverlayParentView] ?: [self resolveBusinessWindow];
-        if (!root) {
-            return;
-        }
-        static const NSInteger kTipTag = 88215602;
-        UIView *old = [root viewWithTag:kTipTag];
-        [old.layer removeAllAnimations];
-        [old removeFromSuperview];
+    if (sPreviewChromeView && !sPreviewChromeView.hidden) {
+        [sPreviewChromeView showFilterName:title];
+        return;
+    }
+    // 媒体页无 PreviewChrome：在取景区中部弹出（对齐相机 tip 高度，避开底栏）
+    UIView *root = sOverlayVideoHost ?: [self resolveOverlayParentView] ?: [self resolveBusinessWindow];
+    if (!root) {
+        return;
+    }
+    static const NSInteger kTipTag = 88215602;
+    UIView *old = [root viewWithTag:kTipTag];
+    [old removeFromSuperview];
 
-        UILabel *label = [[UILabel alloc] init];
-        label.tag = kTipTag;
-        label.text = title;
-        label.textColor = [UIColor whiteColor];
-        label.font = [UIFont systemFontOfSize:32 weight:UIFontWeightSemibold];
-        label.textAlignment = NSTextAlignmentCenter;
-        label.backgroundColor = [UIColor clearColor];
-        label.layer.shadowColor = [UIColor blackColor].CGColor;
-        label.layer.shadowOpacity = 0.55;
-        label.layer.shadowRadius = 4;
-        label.layer.shadowOffset = CGSizeMake(0, 1);
-        label.layer.zPosition = 50000.f;
-        label.numberOfLines = 1;
-        CGFloat maxW = MIN(CGRectGetWidth(root.bounds) - 48.f, 320.f);
-        CGSize size = [label sizeThatFits:CGSizeMake(maxW, 60.f)];
-        CGFloat w = MIN(maxW, MAX(120.f, size.width + 28.f));
-        CGFloat h = MAX(40.f, size.height + 12.f);
-        CGFloat panelH = sLastBeautyPanelHeight > 0 ? sLastBeautyPanelHeight : 80.f;
-        CGFloat tipCenterY = (CGRectGetHeight(root.bounds) - panelH) * 0.42f;
-        label.frame = CGRectMake((CGRectGetWidth(root.bounds) - w) * 0.5f, tipCenterY - h * 0.5f, w, h);
-        label.alpha = 0;
-        [root addSubview:label];
-        [root bringSubviewToFront:label];
-        [UIView animateWithDuration:0.18 animations:^{
-            label.alpha = 1;
-        } completion:^(__unused BOOL finished) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [UIView animateWithDuration:0.22 animations:^{
-                    label.alpha = 0;
-                } completion:^(__unused BOOL done) {
-                    [label removeFromSuperview];
-                }];
-            });
-        }];
-    });
+    UILabel *label = [[UILabel alloc] init];
+    label.tag = kTipTag;
+    label.text = title;
+    label.textColor = [UIColor whiteColor];
+    label.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
+    label.textAlignment = NSTextAlignmentCenter;
+    label.backgroundColor = [UIColor clearColor];
+    label.layer.shadowColor = [UIColor blackColor].CGColor;
+    label.layer.shadowOpacity = 0.55;
+    label.layer.shadowRadius = 4;
+    label.layer.shadowOffset = CGSizeMake(0, 1);
+    label.layer.zPosition = 50000.f; // 高于美颜面板 30100，避免滤镜名被挡住
+    label.numberOfLines = 1;
+    CGFloat maxW = MIN(CGRectGetWidth(root.bounds) - 48.f, 280.f);
+    CGSize size = [label sizeThatFits:CGSizeMake(maxW, 40.f)];
+    CGFloat w = MIN(maxW, MAX(96, size.width + 8));
+    CGFloat h = MAX(28, size.height);
+    CGFloat panelH = sLastBeautyPanelHeight > 0 ? sLastBeautyPanelHeight : 80;
+    CGFloat tipCenterY = (CGRectGetHeight(root.bounds) - panelH) * 0.42;
+    label.frame = CGRectMake((CGRectGetWidth(root.bounds) - w) * 0.5f, tipCenterY - h * 0.5f, w, h);
+    label.alpha = 0;
+    [root addSubview:label];
+    [root bringSubviewToFront:label];
+    [UIView animateWithDuration:0.18 animations:^{
+        label.alpha = 1;
+    } completion:^(__unused BOOL finished) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [UIView animateWithDuration:0.22 animations:^{
+                label.alpha = 0;
+            } completion:^(__unused BOOL done) {
+                [label removeFromSuperview];
+            }];
+        });
+    }];
 }
 
 - (void)releaseCameraKeepAliveInternal:(void (^)(void))onComplete {
@@ -3972,7 +3778,7 @@ UNI_EXPORT_METHOD(@selector(destroy:))
 
     // 组件托管：只销毁预览，不removeFromSuperview
     if (sCameraHostedByComponent && !sOverlayCameraHost) {
-        BeautyCameraView *view = sOverlayCameraView;
+        FURenderKitCameraView *view = sOverlayCameraView;
         // 立刻回调，避免导入跳转卡在黑屏等teardown
         [view destroyPreviewAsync:nil];
         [self resetOverlayLayoutCache];
@@ -3982,7 +3788,7 @@ UNI_EXPORT_METHOD(@selector(destroy:))
         return;
     }
 
-    BeautyCameraView *view = sOverlayCameraView;
+    FURenderKitCameraView *view = sOverlayCameraView;
     UIView *host = sOverlayCameraHost;
     sOverlayCameraView = nil;
     sOverlayCameraHost = nil;
@@ -4012,7 +3818,7 @@ UNI_EXPORT_METHOD(@selector(destroy:))
 }
 
 - (void)ensureInitialized {
-    if (fuIsLibraryInit() == 0) {
+    if ([FURenderKit shareRenderKit] == nil) {
         @throw [NSException exceptionWithName:@"IllegalState" reason:@"请先 init" userInfo:nil];
     }
 }
@@ -4093,6 +3899,70 @@ UNI_EXPORT_METHOD(@selector(destroy:))
         @throw [NSException exceptionWithName:@"FileNotFound" reason:[NSString stringWithFormat:@"文件不存在 %@", realPath] userInfo:nil];
     }
     return data;
+}
+
+/** 追加诊断日志到沙盒 Documents/nama_diag.log（离线打包便于导出诊断） */
+- (void)appendDiagFile:(NSString *)line {
+    @try {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *doc = paths.firstObject;
+        if (doc.length == 0) {
+            return;
+        }
+        NSString *file = [doc stringByAppendingPathComponent:@"nama_diag.log"];
+        NSDate *now = [NSDate date];
+        NSString *entry = [NSString stringWithFormat:@"%@ %@\n", now, line];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:file];
+        if (fh) {
+            @try {
+                [fh seekToEndOfFile];
+                [fh writeData:[entry dataUsingEncoding:NSUTF8StringEncoding]];
+            } @finally {
+                [fh closeFile];
+            }
+        } else {
+            [entry writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    } @catch (NSException *e) {
+        // 忽略日志写入异常
+    }
+}
+
+/**
+ * 从随插件内置的 FURenderKit.framework/FURenderKit.bundle 里找资源。
+ * 返回绝对路径；找不到返回 nil。
+ */
+- (NSString *)furKitBundlePathForResource:(NSString *)name ofType:(NSString *)ext {
+    NSBundle *mainB = [NSBundle mainBundle];
+    // 优先：mainBundle 根的 FURenderKit.bundle（CocoaPods resources 会把 bundle 平铺到 mainBundle）
+    NSString *mainDir = [mainB.bundlePath stringByAppendingPathComponent:@"FURenderKit.bundle"];
+    NSString *mainPath = [[mainDir stringByAppendingPathComponent:name] stringByAppendingPathExtension:ext];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:mainPath]) {
+        return mainPath;
+    }
+    // 其次：mainBundle 根直接平铺
+    NSString *rootPath = [mainB pathForResource:name ofType:ext];
+    if (rootPath) {
+        return rootPath;
+    }
+    // 兜底：framework 内 FURenderKit.bundle
+    NSBundle *kitBundle = [NSBundle bundleForClass:[FURenderKit class]];
+    if (kitBundle) {
+        NSString *bundleDir = [kitBundle.bundlePath stringByAppendingPathComponent:@"FURenderKit.bundle"];
+        NSString *direct = [[bundleDir stringByAppendingPathComponent:name] stringByAppendingPathExtension:ext];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:direct]) {
+            return direct;
+        }
+        NSString *bundlePath = [kitBundle pathForResource:@"FURenderKit" ofType:@"bundle"];
+        if (bundlePath) {
+            NSBundle *res = [NSBundle bundleWithPath:bundlePath];
+            NSString *p = [res pathForResource:name ofType:ext];
+            if (p) {
+                return p;
+            }
+        }
+    }
+    return nil;
 }
 
 @end

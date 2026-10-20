@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 unpackage/
 package-lock.json
@@ -17,3 +17,21 @@ scripts/build-bridge/tools/
 Thumbs.db
 .env
 .env.*
+.local/
+.gradle/
+.idea/
+*.iml
+local.properties
+**/build/
+**/authpack.java
+**/authpack.h
+*.jks
+*.keystore
+*.p12
+*.mobileprovision
+nativeplugins/FaceUnity-Nama/android/FaceUnity-Nama.aar
+nativeplugins/FaceUnity-Nama/ios/FaceUnityNama.framework/
+android-local-host-5.15/simpleDemo/src/main/assets/apps/
+android-local-host-5.15/simpleDemo/libs/FaceUnity-Nama.aar
+android-local-host-5.15/simpleDemo/libs/fu_*.aar
+android-local-host-5.15/simpleDemo/libs/exoplayer-core-*.aar

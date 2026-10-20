@@ -8,3 +8,15 @@ declare module '@vue/runtime-core' {
 
   }
 }
+
+declare global {
+  interface Plus {
+    globalEvent: {
+      addEventListener: (name: string, handler: (e?: Record<string, unknown>) => void) => void
+      removeEventListener: (name: string, handler: (e?: Record<string, unknown>) => void) => void
+    }
+  }
+  interface PlusWebviewWebviewObject {
+    getPosition: () => { left?: number; top?: number }
+  }
+}

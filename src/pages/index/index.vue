@@ -1,7 +1,7 @@
 <template>
   <view class="page">
     <view class="header" :style="headerStyle">
-      <view class="header__title">FULiveUniDemo</view>
+      <view class="header__title">FU Live Demo 特效版</view>
     </view>
 
     <view class="body" :class="{ 'body--compact': isCompactScreen }" :style="scrollStyle">
@@ -49,13 +49,7 @@ import {
   applyStatusBarStyle,
   hideNativeTitleNView,
 } from '@/utils/app-plus-style'
-import {
-  ensureAndroidNamaSessionFresh,
-  ensureMediaPermissions,
-  isNamaReady,
-  preloadNamaSdk,
-  requestNativePermissions,
-} from '@/utils/nama-app'
+import { ensureMediaPermissions, preloadNamaSdk,isNamaReady, requestNativePermissions } from '@/utils/nama-app'
 
 const HEADER_CONTENT_PX = 44
 const safeAreaTop = ref(0)
@@ -108,30 +102,19 @@ onShow(() => {
   hideNativeTitleNView()
   applyStatusBarStyle()
   // #ifdef APP-PLUS
-  // 系统导航切换后若进程还在、Activity 已死：整进程冷启动，不修半死 overlay
-  ensureAndroidNamaSessionFresh()
-    .then(() => {
-      if (!isNamaReady()) {
-        return preloadNamaSdk()
-      }
-    })
-    .catch(() => undefined)
+  // Activity 重建后 SDK 可能已失效（ensureAndroidNamaAlive 会处理），
+  // 这里兜底：若 SDK 仍未就绪则重新预热，避免首页不初始化
+  if (!isNamaReady()) {
+    setTimeout(() => {
+      preloadNamaSdk().catch(() => undefined)
+    }, 200)
+  }
   // #endif
 })
 
-let navigatingBeauty = false
-async function goBeauty() {
+function goBeauty() {
   // #ifdef APP-PLUS
-  if (navigatingBeauty) {
-    return
-  }
-  navigatingBeauty = true
-  try {
-    await ensureAndroidNamaSessionFresh()
-    uni.navigateTo({ url: '/pages/beauty/beauty' })
-  } finally {
-    navigatingBeauty = false
-  }
+  uni.navigateTo({ url: '/pages/beauty/beauty' })
   // #endif
   // #ifndef APP-PLUS
   uni.showToast({ title: '请运行到 App 自定义基座', icon: 'none' })

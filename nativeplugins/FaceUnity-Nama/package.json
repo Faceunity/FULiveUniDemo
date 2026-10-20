@@ -2,7 +2,7 @@
   "name": "FaceUnity-Nama",
   "id": "FaceUnity-Nama",
   "version": "1.2.1",
-  "description": "FaceUnity CNama SDK 9.0.1（皮肤分割/祛斑/丰盈/全身磨皮/瞳孔）",
+  "description": "FaceUnity CNama SDK",
   "_dp_type": "nativeplugin",
   "_dp_nativeplugin": {
     "android": {
@@ -13,9 +13,6 @@
           "name": "FaceUnity-Nama",
           "class": "com.faceunity.nama.NamaModule"
         }
-      ],
-      "libs": [
-        "nama.jar"
       ],
       "abis": [
         "armeabi-v7a",
@@ -38,6 +35,7 @@
       ],
       "frameworks": [
         "FaceUnityNama.framework",
+        "FURenderKit.framework",
         "GLKit.framework",
         "OpenGLES.framework",
         "Accelerate.framework",
@@ -48,10 +46,17 @@
         "Photos.framework",
         "UIKit.framework",
         "Foundation.framework",
-        "WebKit.framework"
+        "WebKit.framework",
+        "AudioToolbox.framework",
+        "CoreImage.framework",
+        "CoreMotion.framework",
+        "ImageIO.framework",
+        "Metal.framework",
+        "QuartzCore.framework"
       ],
       "embedFrameworks": [
-        "FaceUnityNama.framework"
+        "FaceUnityNama.framework",
+        "FURenderKit.framework"
       ],
       "privacies": [
         "NSCameraUsageDescription",

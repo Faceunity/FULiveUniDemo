@@ -1,0 +1,13 @@
+{
+  "nativePlugins": [
+    {
+      "plugins": [
+        {
+          "type": "module",
+          "name": "FaceUnity-Nama",
+          "class": "com.faceunity.nama.NamaModule"
+        }
+      ]
+    }
+  ]
+}
