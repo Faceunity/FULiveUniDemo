@@ -108,7 +108,7 @@
 
 .effect-card {
   width: 33.333%;
-  padding: 0 8px 16px;
+  padding: 0 8px 10px;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
@@ -120,7 +120,7 @@
   position: relative;
   /* 部分 Android WebView 不支持 aspect-ratio，用 padding 比例占位 */
   height: 0;
-  padding-bottom: 90.59%;
+  padding-bottom: 56%;
   flex-shrink: 0;
   background: #1f1d35;
   border-radius: 5px 5px 0 0;
@@ -130,10 +130,10 @@
 
 .effect-card__icon {
   position: absolute;
-  left: 26%;
-  top: 26%;
-  width: 48%;
-  height: 48%;
+  left: 30%;
+  top: 30%;
+  width: 40%;
+  height: 40%;
   display: block;
 }
 
@@ -141,7 +141,7 @@
   width: 100%;
   position: relative;
   height: 0;
-  padding-bottom: 25%;
+  padding-bottom: 20%;
   flex-shrink: 0;
   border-radius: 0 0 5px 5px;
   overflow: hidden;

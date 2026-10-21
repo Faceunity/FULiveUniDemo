@@ -38,7 +38,6 @@
     "deps:android": "powershell -ExecutionPolicy Bypass -File scripts/build-bridge/download-deps.ps1",
     "build:native-bridge": "bash scripts/build-bridge/build-aar.sh",
     "build:native-bridge:win": "powershell -ExecutionPolicy Bypass -File scripts/build-bridge/build-aar.ps1",
-    "slim:ios-libs": "bash scripts/build-ios-framework/slim-ios-sdk.sh",
     "build:ios-framework": "bash scripts/build-ios-framework/build-slim-framework.sh"
   },
   "dependencies": {

@@ -26,10 +26,7 @@ import {
   DEFAULT_FILTER_ID,
   FILTER_LEVEL_ITEM,
   defaultSliderValue,
-  getFilterLevelSliderUi,
   getFilterPresetById,
-  migrateGlobalFilterLevel,
-  setFilterLevelSliderUi,
   isBeautyParamAllowed,
   sliderToValue,
   valueToSlider,
@@ -58,11 +55,11 @@ import {
   setBeautyParam,
   setBeautyStringParam,
   setOverlayWindowsHidden,
-  setPreviewResolution,
   resetPreviewResolution,
   showCameraPreview,
   switchCameraFacing,
   setNamaPipeline,
+  waitForMediaPreviewCleanup,
   tapFocusAt,
   showPreviewChrome,
   hidePreviewChrome,
@@ -73,7 +70,6 @@ import {
   showBeautyPanel,
   hideBeautyPanel,
   updateBeautyPanelValues,
-  type PreviewResolutionPreset,
   PREVIEW_RESOLUTION_PRESETS,
 } from '@/utils/nama-app'
 import {
@@ -188,7 +184,6 @@ let cameraMounting = false
 let pageReady = false
 let pendingDestroy: Promise<void> = Promise.resolve()
 let needsCameraRemount = false
-let pageWasHidden = false
 let statsTimer: ReturnType<typeof setInterval> | null = null
 
 function tryStartCamera() {
@@ -330,7 +325,6 @@ async function mountNativeCameraPreview(retry = 0) {
 ALL_SLIDER_EFFECTS.forEach((item) => {
   sliderValues[item.key] = defaultSliderValue(item)
 })
-migrateGlobalFilterLevel(sliderValues, DEFAULT_FILTER_ID)
 
 async function applyBeautyParamsToSdk() {
   if (!isNamaReady()) {
@@ -346,7 +340,7 @@ async function applyBeautyParamsToSdk() {
   const filter = getFilterPresetById(selectedFilterId.value)
   await setBeautyStringParam('filter_name', filter.key)
   for (const item of ALL_SLIDER_EFFECTS) {
-    if (item.unimplemented || item.key === 'filter_level') {
+    if (item.unimplemented) {
       continue
     }
     if (isEffectDisabled(item)) {
@@ -355,10 +349,6 @@ async function applyBeautyParamsToSdk() {
     }
     await setBeautyParam(item.key, sliderToValue(sliderValues[item.key], item))
   }
-  await setBeautyParam(
-    'filter_level',
-    sliderToValue(getFilterLevelSliderUi(sliderValues, selectedFilterId.value), FILTER_LEVEL_ITEM),
-  )
 }
 
 async function syncBeautyAfterCameraMount() {
@@ -455,7 +445,6 @@ onLoad(async () => {
 
   cameraMounted = false
   cameraMounting = false
-  pageWasHidden = false
   initReady.value = false
   selectedResolutionId.value = '720'
   resetPreviewResolution().catch(() => undefined)
@@ -518,7 +507,6 @@ onShow(() => {
     return
   }
   const resume = async () => {
-    pageWasHidden = false
     if (!isNamaReady()) {
       await initNamaForBeauty()
       await applyBeautyParamsToSdk()
@@ -532,10 +520,11 @@ onShow(() => {
       tryStartCamera()
       return
     }
-    syncBeautyAfterCameraMount().catch(() => undefined)
     try {
+      await waitForMediaPreviewCleanup().catch(() => undefined)
       await setOverlayWindowsHidden(false).catch(() => undefined)
       await resumeCameraPreview()
+      await syncBeautyAfterCameraMount()
       try {
         const diag = await getPreviewDiag().catch(() => null)
         const mounted = diag && (diag as { mounted?: boolean }).mounted
@@ -563,7 +552,6 @@ onShow(() => {
 })
 
 onHide(() => {
-  pageWasHidden = true
   stopStatsPoll()
   unbindBeautyPanelEvents()
   hideFocusChrome().catch(() => undefined)
@@ -738,11 +726,7 @@ function onBeautyPanelEvent(e: Record<string, unknown>) {
       ALL_SLIDER_EFFECTS.find((i) => i.key === key) ||
       (key === 'filter_level' ? FILTER_LEVEL_ITEM : null)
     if (item) {
-      if (key === 'filter_level') {
-        setFilterLevelSliderUi(sliderValues, selectedFilterId.value, valueToSlider(sdk, item))
-      } else {
-        sliderValues[key] = valueToSlider(sdk, item)
-      }
+      sliderValues[key] = valueToSlider(sdk, item)
     }
     return
   }
@@ -801,12 +785,18 @@ function onPreviewChromeEvent(e: {
     return
   }
   if (action === 'captureLongPress') {
-    onCaptureLongPress()
+    const payload = e as { ok?: number | boolean; message?: string }
+    const ok = payload.ok === undefined || Number(payload.ok) !== 0 || payload.ok === true
+    if (ok) {
+      onCaptureLongPressUI()
+    } else if (payload.message) {
+      showAppToast(payload.message, { icon: 'none', duration: 2500 })
+    }
     return
   }
   if (action === 'captureUp') {
     if (e.longPress) {
-      onCaptureTouchEnd()
+      onCaptureLongPressEndUI()
     } else {
       onCaptureTouchStart()
       onCaptureTouchEnd()
@@ -822,15 +812,11 @@ function onPreviewChromeEvent(e: {
     return
   }
   if (action === 'recordAutoStopped') {
-    clearRecordMaxTimer()
-    recordIntent = false
-    recordingVideo.value = false
-    setPreviewChromeRecording(false).catch(() => undefined)
-    const ok = Number((e as { ok?: number | boolean }).ok) === 1 || (e as { ok?: boolean }).ok === true
-    if (ok) {
-      showAppToast('视频已保存', { icon: 'success' })
-    }
-    captureLongPressTriggered = false
+    onRecordFinished(e as { ok?: number | boolean; message?: string })
+    return
+  }
+  if (action === 'recordStopped') {
+    onRecordFinished(e as { ok?: number | boolean; message?: string })
     return
   }
   if (action === 'dualInput') {
@@ -838,9 +824,11 @@ function onPreviewChromeEvent(e: {
     return
   }
   if (action === 'resolution') {
+    // 原生 PreviewChrome 已 applyPreviewResolutionById；此处只同步 Vue 状态。
     const preset = PREVIEW_RESOLUTION_PRESETS.find((p) => p.id === e.id)
     if (preset) {
-      onSelectResolution(preset)
+      selectedResolutionId.value = preset.id
+      statsLabel.value = `${preset.label}.0.0`
     }
     return
   }
@@ -884,16 +872,6 @@ function onPreviewTap(e: { detail: { x: number; y: number } }) {
     .exec()
 }
 
-async function onSelectResolution(preset: PreviewResolutionPreset) {
-  selectedResolutionId.value = preset.id
-  try {
-    await setPreviewResolution(preset.width, preset.height)
-    statsLabel.value = `${preset.label}.0.0`
-  } catch (e) {
-    uni.showToast({ title: (e as Error).message, icon: 'none' })
-  }
-}
-
 async function goImportMedia() {
   hideFocusChrome().catch(() => undefined)
   hidePreviewChrome().catch(() => undefined)
@@ -907,7 +885,7 @@ async function goImportMedia() {
     hideCameraPreview().catch(() => undefined)
     return
   }
-  // 安卓：先藏/拆相机层，避免 Surface 盖住导入页
+  // 安卓：先 softHide 卸 ZOrder，避免相机 Surface 盖住导入页
   try {
     await hideCameraPreview()
   } catch {
@@ -986,28 +964,67 @@ function onCaptureTouchStart() {
   clearCaptureLongPressTimer()
   captureLongPressTimer = setTimeout(() => {
     captureLongPressTimer = null
-    onCaptureLongPress()
+    void onCaptureLongPress()
   }, 320)
 }
 
-function onCaptureLongPress() {
-  if (recordingVideo.value || recordIntent) {
+async function onCaptureLongPress() {
+  if (recordingVideo.value) {
+    return
+  }
+  recordIntent = true
+  onCaptureLongPressUI()
+  try {
+    await ensureStoragePermission()
+    await startCameraVideoRecord()
+  } catch (e) {
+    onCaptureLongPressEndUI()
+    showAppToast((e as Error).message, { icon: 'none', duration: 2500 })
+  }
+}
+
+function onCaptureLongPressUI() {
+  if (recordingVideo.value) {
     return
   }
   captureLongPressTriggered = true
-  clearCaptureLongPressTimer()
-  startVideoRecording().catch(() => undefined)
+  recordingVideo.value = true
+  setPreviewChromeRecording(true).catch(() => undefined)
+  clearRecordMaxTimer()
+  recordMaxTimer = setTimeout(() => {
+    recordMaxTimer = null
+    if (recordingVideo.value) {
+      stopVideoRecording().catch(() => undefined)
+    }
+  }, RECORD_MAX_MS)
+}
+
+function onCaptureLongPressEndUI() {
+  clearRecordMaxTimer()
+  recordIntent = false
+  recordingVideo.value = false
+  setPreviewChromeRecording(false).catch(() => undefined)
+  captureLongPressTriggered = false
+}
+
+function onRecordFinished(e: { ok?: number | boolean; message?: string }) {
+  clearRecordMaxTimer()
+  recordIntent = false
+  recordingVideo.value = false
+  setPreviewChromeRecording(false).catch(() => undefined)
+  captureLongPressTriggered = false
+  const ok = Number(e.ok) === 1 || e.ok === true
+  if (ok) {
+    showAppToast('视频已保存', { icon: 'success' })
+  } else if (e.message) {
+    showAppToast(e.message, { icon: 'none', duration: 2500 })
+  }
 }
 
 function onCaptureTouchEnd() {
   const shortTap = captureLongPressTimer != null
   clearCaptureLongPressTimer()
-  if (recordingVideo.value || recordIntent) {
-    stopVideoRecording().catch(() => undefined)
-    return
-  }
-  if (captureLongPressTriggered) {
-    captureLongPressTriggered = false
+  if (captureLongPressTriggered || recordingVideo.value) {
     return
   }
   if (shortTap) {
@@ -1017,52 +1034,11 @@ function onCaptureTouchEnd() {
 
 function onCaptureTouchCancel() {
   clearCaptureLongPressTimer()
-  if (recordingVideo.value || recordIntent) {
+  if (recordingVideo.value) {
+    onCaptureLongPressEndUI()
     stopVideoRecording().catch(() => undefined)
   }
   captureLongPressTriggered = false
-}
-
-async function startVideoRecording() {
-  if (recordingVideo.value || recordIntent) {
-    return
-  }
-  recordIntent = true
-  captureLongPressTriggered = true
-  try {
-    await ensureStoragePermission()
-    try {
-      await ensureMicrophonePermission()
-    } catch {
-      // ignore
-    }
-    await startCameraVideoRecord()
-    if (!recordIntent) {
-      try {
-        await stopCameraVideoRecord()
-      } catch {
-        // ignore
-      }
-      captureLongPressTriggered = false
-      return
-    }
-    recordingVideo.value = true
-    setPreviewChromeRecording(true).catch(() => undefined)
-    clearRecordMaxTimer()
-    recordMaxTimer = setTimeout(() => {
-      recordMaxTimer = null
-      if (recordingVideo.value || recordIntent) {
-        stopVideoRecording().catch(() => undefined)
-      }
-    }, RECORD_MAX_MS)
-  } catch (e) {
-    recordIntent = false
-    captureLongPressTriggered = false
-    recordingVideo.value = false
-    setPreviewChromeRecording(false).catch(() => undefined)
-    clearRecordMaxTimer()
-    showAppToast((e as Error).message, { icon: 'none', duration: 2500 })
-  }
 }
 
 async function stopVideoRecording() {

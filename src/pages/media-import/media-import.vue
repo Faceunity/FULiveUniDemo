@@ -29,7 +29,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { onLoad, onShow } from '@dcloudio/uni-app'
+import { onLoad, onShow, onUnload } from '@dcloudio/uni-app'
 import {
   applyStatusBarStyle,
   hideNativeTitleNView,
@@ -40,6 +40,7 @@ import {
   pauseCameraPreview,
   pickMediaFromAlbum,
   setOverlayWindowsHidden,
+  destroyVideoPreview,
 } from '@/utils/nama-app'
 import { setPendingMedia } from '@/utils/pending-media'
 
@@ -82,6 +83,13 @@ onShow(() => {
   applyStatusBarStyle()
   void setOverlayWindowsHidden(true).catch(() => undefined)
   void pauseCameraPreview().catch(() => undefined)
+})
+
+onUnload(() => {
+  // 离开选文件页（回首页等）时释放温存的视频 overlay
+  if (isIOSPlatform()) {
+    void destroyVideoPreview(true).catch(() => undefined)
+  }
 })
 
 function goBack() {
